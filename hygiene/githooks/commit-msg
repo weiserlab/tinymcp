@@ -1,0 +1,19 @@
+#!/bin/sh
+#
+# tinymcp v0.1
+# The Model Context Protocol server as a library any firmware can carry.
+# http://tinymcp.org
+#
+# Authors: Ambuj Varshney <ambuj@tiku-os.org>
+#
+# commit-msg - hold the message to the shape in commit-style.md.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# hygiene/install_hooks.sh points core.hooksPath here, so the checker is
+# found from this file rather than from the working directory.
+hook_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+checker="$hook_dir/../check_commit_msg.py"
+
+[ -x "$checker" ] || exit 0
+exec "$checker" "$1"

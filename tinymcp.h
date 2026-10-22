@@ -1,0 +1,222 @@
+/*
+ * tinymcp v0.1
+ * The Model Context Protocol server as a library any firmware can carry.
+ * http://tinymcp.org
+ *
+ * Authors: Ambuj Varshney <ambuj@tiku-os.org>
+ *
+ * tinymcp.h - the server: the host fills a table of tools, resources and a
+ * send function, owns two buffers, and feeds bytes; the library answers in
+ * the 2026-07-28 stateless protocol and the initialize-era one before it.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef TINYMCP_H
+#define TINYMCP_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "tinymcp_json.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define TINYMCP_VERSION  "0.1.0"
+#define TINYMCP_API      1             /* bumped on any change to tinymcp_host_t */
+#define TINYMCP_PROTOCOL "2026-07-28"  /* the newest revision served */
+
+#ifndef TINYMCP_SUBS_MAX
+#define TINYMCP_SUBS_MAX 4    /* subscription slots in a tinymcp_t */
+#endif
+#ifndef TINYMCP_URI_MAX
+#define TINYMCP_URI_MAX 96    /* a subscribed URI, with its terminator */
+#endif
+#ifndef TINYMCP_ID_MAX
+#define TINYMCP_ID_MAX 32     /* a listen request's id as sent, with terminator */
+#endif
+#ifndef TINYMCP_ARGS_MAX
+#define TINYMCP_ARGS_MAX 8    /* tool arguments kept; later ones are dropped */
+#endif
+
+/* What a host function returns. */
+#define TINYMCP_OK          0
+#define TINYMCP_TOOL_ERROR  1     /* tool_call: the text is the error, isError true */
+#define TINYMCP_ENOENT    (-1)    /* no such resource */
+#define TINYMCP_EEFFECT   (-2)    /* reading would act; the client is told to use a tool */
+#define TINYMCP_EINVAL    (-3)    /* an argument is missing or wrong */
+#define TINYMCP_EFULL     TINYMCP_JSON_EFULL
+#define TINYMCP_EIO       (-5)    /* the host could not do it */
+/* A value at or below -32000 is sent as that JSON-RPC error code. */
+
+typedef enum tinymcp_era {
+    TINYMCP_ERA_NONE = 0,   /* nothing decided yet */
+    TINYMCP_ERA_MODERN,     /* a request with _meta.protocolVersion has been served */
+    TINYMCP_ERA_LEGACY      /* initialize has been answered */
+} tinymcp_era_t;
+
+typedef struct tinymcp_tool {
+    const char *name;
+    const char *description;   /* may be NULL */
+    const char *input_schema;  /* a JSON Schema object as JSON text */
+} tinymcp_tool_t;
+
+typedef struct tinymcp_template {
+    const char *uri_template;  /* RFC 6570 */
+    const char *name;
+    const char *description;   /* may be NULL */
+} tinymcp_template_t;
+
+/** One tool argument, decoded; str is set for a string, num for a number. */
+typedef struct tinymcp_arg {
+    const char *key;
+    const char *str;
+    const char *raw;
+    size_t raw_len;
+    long num;
+    tinymcp_jtype_t type;
+} tinymcp_arg_t;
+
+typedef struct tinymcp_args {
+    unsigned n;
+    tinymcp_arg_t a[TINYMCP_ARGS_MAX];
+} tinymcp_args_t;
+
+/** NULL unless the argument is present and a string. */
+const char *tinymcp_arg_str(const tinymcp_args_t *args, const char *key);
+/** dflt unless the argument is present and a number. */
+long tinymcp_arg_int(const tinymcp_args_t *args, const char *key, long dflt);
+/** dflt unless the argument is present and true or false. */
+int tinymcp_arg_bool(const tinymcp_args_t *args, const char *key, int dflt);
+
+/** The resources/list reply under construction. */
+typedef struct tinymcp_list {
+    tinymcp_jw_t *w;
+    size_t limit;
+    unsigned count;
+} tinymcp_list_t;
+
+/**
+ * Add one resource entry; description may be NULL.
+ * @return 0, or TINYMCP_EFULL when it did not fit, in which case the host
+ *         returns this entry's cursor so the next page starts with it.
+ */
+int tinymcp_list_add(tinymcp_list_t *list, const char *uri, const char *name,
+                     const char *description);
+
+/**
+ * What the host provides.  Strings are kept by pointer and must outlive the
+ * instance.  A NULL resource_list serves no resources; a NULL watch serves
+ * no subscriptions.
+ */
+typedef struct tinymcp_host {
+    const char *name;          /* serverInfo.name */
+    const char *version;       /* serverInfo.version */
+    const char *instructions;  /* may be NULL */
+    const tinymcp_tool_t *tools;
+    unsigned ntools;
+    const tinymcp_template_t *templates;
+    unsigned ntemplates;
+    /*
+     * Add entries from cursor on (0 starts) with tinymcp_list_add() until
+     * one does not fit; return that entry's cursor (1 or more), 0 after the
+     * last entry, TINYMCP_EFULL when not even the first fit, or another
+     * negative code.
+     */
+    int (*resource_list)(void *ctx, unsigned cursor, tinymcp_list_t *list);
+    /*
+     * Write the resource's text into the sink; line and bytes are the
+     * URI's ?line=&bytes= query, 0 when absent.  TINYMCP_ENOENT,
+     * TINYMCP_EEFFECT, TINYMCP_EINVAL or 0.
+     */
+    int (*resource_read)(void *ctx, const char *uri, unsigned line,
+                         unsigned bytes, tinymcp_sink_t *text);
+    /*
+     * Run the tool named name, which is one of tools[]; write its output.
+     * TINYMCP_OK, TINYMCP_TOOL_ERROR, TINYMCP_EINVAL, or a code.
+     */
+    int (*tool_call)(void *ctx, const char *name, const tinymcp_args_t *args,
+                     tinymcp_sink_t *text);
+    /*
+     * Start watching uri under slot; later changes are reported with
+     * tinymcp_updated(slot).  Nonzero refuses the subscription.
+     */
+    int (*watch)(void *ctx, const char *uri, unsigned slot);
+    void (*unwatch)(void *ctx, unsigned slot);
+    /* One whole message without a trailing newline; nonzero means not sent. */
+    int (*send)(void *ctx, const char *msg, size_t len);
+} tinymcp_host_t;
+
+typedef struct tinymcp_sub {
+    char uri[TINYMCP_URI_MAX];   /* empty: a list-changed listen alone */
+    char id[TINYMCP_ID_MAX];     /* the listen request's id as sent; empty: legacy */
+    unsigned seq;
+    unsigned char used;
+    unsigned char listchanged;
+} tinymcp_sub_t;
+
+/** One server instance: one stream, one request in flight. */
+typedef struct tinymcp {
+    const tinymcp_host_t *host;
+    void *ctx;
+    char *in;
+    size_t in_cap;
+    size_t in_len;
+    unsigned char in_drop;      /* a line longer than in fits is being skipped */
+    char *out;
+    size_t out_cap;
+    unsigned max_subs;
+    tinymcp_sub_t subs[TINYMCP_SUBS_MAX];
+    unsigned sub_seq;
+    tinymcp_era_t era;
+    const char *legacy_version; /* the version initialize settled on */
+    unsigned char busy;         /* inside a request: notifications wait */
+    unsigned pending;           /* slots whose update waits, one bit each */
+    unsigned char pending_lc;
+    unsigned requests;
+    unsigned errors;
+    unsigned dropped;           /* messages send() refused */
+} tinymcp_t;
+
+/**
+ * Bind an instance to its host and buffers.  in holds one message as it
+ * arrives (in_cap - 1 bytes at most); out holds one reply.  max_subs is
+ * clamped to TINYMCP_SUBS_MAX.
+ */
+void tinymcp_init(tinymcp_t *t, const tinymcp_host_t *host, void *ctx,
+                  char *in, size_t in_cap, char *out, size_t out_cap,
+                  unsigned max_subs);
+
+/**
+ * Bytes from a stream, one message per line.  Replies and notifications go
+ * out through host->send before this returns.
+ * @return the number of messages handled.
+ */
+int tinymcp_feed(tinymcp_t *t, const void *bytes, size_t len);
+
+/**
+ * One whole message from a framing transport; a trailing newline is fine.
+ * @return 0, or -1 when it is larger than the in buffer (a parse error
+ *         reply has then been sent).
+ */
+int tinymcp_message(tinymcp_t *t, const void *msg, size_t len);
+
+/** The resource under slot changed: notifications/resources/updated. */
+void tinymcp_updated(tinymcp_t *t, unsigned slot);
+
+/** The set of resources changed: notifications/resources/list_changed. */
+void tinymcp_listchanged(tinymcp_t *t);
+
+/** The transport is gone: subscriptions end and the era is forgotten. */
+void tinymcp_closed(tinymcp_t *t);
+
+/** "none", "modern" or "legacy". */
+const char *tinymcp_era_name(const tinymcp_t *t);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* TINYMCP_H */
