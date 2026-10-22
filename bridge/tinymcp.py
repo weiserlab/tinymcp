@@ -123,15 +123,10 @@ def open_serial(port, baud):
 
     def work():
         try:
-            # DTR and RTS low before open: the USB-serial bridges of the
-            # ESP boards reset the chip when a host raises them.
-            s = serial.Serial()
-            s.port = port
-            s.baudrate = baud
-            s.timeout = 0.05
-            s.dtr = False
-            s.rts = False
-            s.open()
+            # DTR and RTS asserted on open, pyserial's default: an ESP
+            # board's USB bridge resets the chip when one line drops while
+            # the other stays up, and an open with both low did so too.
+            s = serial.Serial(port, baud, timeout=0.05)
             result["port"] = s
         except Exception as e:  # noqa: BLE001 - reported below
             result["error"] = e

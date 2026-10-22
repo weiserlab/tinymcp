@@ -203,6 +203,13 @@ int tinymcp_feed(tinymcp_t *t, const void *bytes, size_t len);
  */
 int tinymcp_message(tinymcp_t *t, const void *msg, size_t len);
 
+/**
+ * One whole message in the host's own buffer, decoded there: msg[len]
+ * must be writable, and the bytes are not the host's afterwards.  For a
+ * transport that already holds the message and gave no in buffer.
+ */
+void tinymcp_handle(tinymcp_t *t, char *msg, size_t len);
+
 /** The resource under slot changed: notifications/resources/updated. */
 void tinymcp_updated(tinymcp_t *t, unsigned slot);
 

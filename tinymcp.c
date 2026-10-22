@@ -1201,12 +1201,19 @@ int tinymcp_message(tinymcp_t *t, const void *msg, size_t len)
         return -1;
     }
     memcpy(t->in, p, len);
-    t->in[len] = 0;
     t->in_len = 0;
     t->in_drop = 0;
-    if (!blank(t->in, len))
-        process(t, t->in, len);
+    tinymcp_handle(t, t->in, len);
     return 0;
+}
+
+void tinymcp_handle(tinymcp_t *t, char *msg, size_t len)
+{
+    while (len && (msg[len - 1] == '\n' || msg[len - 1] == '\r'))
+        len--;
+    msg[len] = 0;
+    if (!blank(msg, len))
+        process(t, msg, len);
 }
 
 void tinymcp_updated(tinymcp_t *t, unsigned slot)
