@@ -1,5 +1,5 @@
 /*
- * tinymcp v0.2
+ * tinymcp v0.3
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
@@ -24,7 +24,7 @@
 extern "C" {
 #endif
 
-#define TINYMCP_VERSION  "0.2.0"
+#define TINYMCP_VERSION  "0.3.0"
 #define TINYMCP_API      2             /* bumped on any change to tinymcp_host_t */
 #define TINYMCP_PROTOCOL "2026-07-28"  /* the newest revision served */
 
@@ -36,6 +36,9 @@ extern "C" {
 #endif
 #ifndef TINYMCP_ID_MAX
 #define TINYMCP_ID_MAX 32     /* a listen request's id as sent, with terminator */
+#endif
+#ifndef TINYMCP_CLIENT_MAX
+#define TINYMCP_CLIENT_MAX 32 /* a client's name, with its terminator; longer is cut */
 #endif
 #ifndef TINYMCP_ARGS_MAX
 #define TINYMCP_ARGS_MAX 8    /* tool or prompt arguments kept; later ones are dropped */
@@ -250,6 +253,7 @@ typedef struct tinymcp {
     unsigned sub_seq;
     tinymcp_era_t era;
     const char *legacy_version; /* the version initialize settled on */
+    char client[TINYMCP_CLIENT_MAX]; /* the requesting client's name, or "" */
     unsigned char busy;         /* inside a request: notifications wait */
     unsigned pending;           /* slots whose update waits, one bit each */
     unsigned char pending_lc;   /* TINYMCP_LC_* notices that wait */
@@ -302,6 +306,12 @@ void tinymcp_closed(tinymcp_t *t);
 
 /** "none", "modern" or "legacy". */
 const char *tinymcp_era_name(const tinymcp_t *t);
+
+/**
+ * The name the client gave in clientInfo: its initialize for the handshake
+ * era, the request's _meta for the current revision; "" when it gave none.
+ */
+const char *tinymcp_client(const tinymcp_t *t);
 
 #ifdef __cplusplus
 }

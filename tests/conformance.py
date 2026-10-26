@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# tinymcp v0.2
+# tinymcp v0.3
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
@@ -15,6 +15,7 @@
 
 import asyncio
 import os
+import re
 import sys
 import tempfile
 
@@ -27,6 +28,9 @@ from mcp.shared.subscriptions import (PromptsListChanged, ResourcesListChanged,
 
 failures = 0
 checks = 0
+
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tinymcp.h")) as f:
+    VERSION = re.search(r'#define TINYMCP_VERSION\s+"([^"]+)"', f.read()).group(1)
 
 
 def expect(cond, what):
@@ -46,7 +50,7 @@ async def common(c, mode, dirpath):
     if mode == "legacy" or mode == "auto":
         expect(c.server_info is not None and c.server_info.name == "tinymcp-posix",
                f"serverInfo name: {c.server_info}")
-        expect(c.server_info is not None and c.server_info.version == "0.2.0",
+        expect(c.server_info is not None and c.server_info.version == VERSION,
                "serverInfo version")
         expect(c.server_info is not None and c.server_info.title == "tinymcp on POSIX",
                f"serverInfo title: {c.server_info}")
@@ -70,7 +74,9 @@ async def common(c, mode, dirpath):
 
     tools = await c.list_tools()
     names = sorted(t.name for t in tools.tools)
-    expect(names == ["echo", "shell", "write"], f"tool names {names}")
+    expect(names == ["echo", "shell", "whoami", "write"], f"tool names {names}")
+    r = await c.call_tool("whoami", {})
+    expect(text_of(r) == "conformance", f"the client's name {text_of(r)!r}")
     echo = next(t for t in tools.tools if t.name == "echo")
     expect(echo.input_schema.get("required") == ["text"], "echo schema kept verbatim")
 
@@ -241,7 +247,9 @@ async def run(mode, exe):
 
         params = StdioServerParameters(command=exe, args=["--dir", dirpath])
         async with Client(params, mode=mode, message_handler=handler,
-                          read_timeout_seconds=10, cache=None) as c:
+                          read_timeout_seconds=10, cache=None,
+                          client_info=types.Implementation(name="conformance",
+                                                           version="1")) as c:
             want = "2025-11-25" if mode == "legacy" else "2026-07-28"
             expect(c.protocol_version == want,
                    f"protocol version {c.protocol_version}, want {want}")

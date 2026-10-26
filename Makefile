@@ -1,5 +1,5 @@
 #
-# tinymcp v0.2
+# tinymcp v0.3
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
@@ -57,7 +57,11 @@ conformance: build/tinymcp_posix $(VENV)/bin/python
 test-bridge: $(VENV)/bin/python
 	$(VENV)/bin/python tests/test_bridge.py
 
-check: test mutants conformance test-bridge
+# attend.py against a stub of the Messages API and a fake board.
+test-attend: $(VENV)/bin/python
+	$(VENV)/bin/python tests/test_attend.py
+
+check: test mutants conformance test-bridge test-attend
 
 # Code and data of the library alone, for the port table.
 size: | build
@@ -75,4 +79,4 @@ lint:
 clean:
 	rm -rf build
 
-.PHONY: all test mutants conformance test-bridge check size lint clean
+.PHONY: all test mutants conformance test-bridge test-attend check size lint clean

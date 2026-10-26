@@ -1,5 +1,5 @@
 /*
- * tinymcp v0.2
+ * tinymcp v0.3
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
@@ -1236,6 +1236,46 @@ static void prompt_templates(void)
     CHECK(tinymcp_render(&sink, tpl, strlen(tpl), &args) == TINYMCP_EINVAL);
 }
 
+#define META_WHO(who) "\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":" \
+    "\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{}," \
+    "\"io.modelcontextprotocol/clientInfo\":{\"name\":" who ",\"version\":\"1\"}}"
+
+static void client_names(void)
+{
+    reset(&host, sizeof out_buf, 4);
+    SAME(tinymcp_client(&t), "");
+    /* The current revision: each request names its client in _meta, and the
+     * params around it still read after the name is kept. */
+    say("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"echo\",\"arguments\":{\"text\":\"hi\"},"
+        META_WHO("\"Claude \\\"Code\\\" \\u00e9\"") "}}");
+    SAME(tinymcp_client(&t), "Claude \"Code\" \xc3\xa9");
+    CONTAINS(last(), "\"text\":\"hi\"}]");
+    say("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\",\"params\":{" META "}}");
+    SAME(tinymcp_client(&t), "");
+    /* A long name is cut, and never inside an escape. */
+    say("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\",\"params\":{"
+        META_WHO("\"0123456789012345678901234567890123456789\"") "}}");
+    SAME(tinymcp_client(&t), "0123456789012345678901234567890");
+    say("{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"ping\",\"params\":{"
+        META_WHO("\"012345678901234567890123456\\u00e9xx\"") "}}");
+    SAME(tinymcp_client(&t), "012345678901234567890123456");
+    say("{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"ping\",\"params\":{"
+        META_WHO("7") "}}");
+    SAME(tinymcp_client(&t), "");
+
+    /* The handshake era: initialize names the client for the session. */
+    reset(&host, sizeof out_buf, 4);
+    say("{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{"
+        "\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},"
+        "\"clientInfo\":{\"name\":\"old-client\",\"version\":\"1\"}}}");
+    SAME(tinymcp_client(&t), "old-client");
+    say("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}");
+    SAME(tinymcp_client(&t), "old-client");
+    tinymcp_closed(&t);
+    SAME(tinymcp_client(&t), "");
+}
+
 int main(void)
 {
     json_edges();
@@ -1254,6 +1294,7 @@ int main(void)
     modern_completion();
     prompts_changed();
     prompt_templates();
+    client_names();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

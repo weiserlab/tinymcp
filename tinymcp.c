@@ -1,5 +1,5 @@
 /*
- * tinymcp v0.2
+ * tinymcp v0.3
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
@@ -23,6 +23,7 @@
 #define META_SUB  "io.modelcontextprotocol/subscriptionId"
 #define META_SRV  "io.modelcontextprotocol/serverInfo"
 #define META_LIB  "org.tinymcp/library"
+#define META_CLI  "io.modelcontextprotocol/clientInfo"
 
 /* Room kept after a page or a text for the closing envelope. */
 #define TAIL_RESERVE 80
@@ -472,6 +473,28 @@ static void do_discover(req_t *r)
     end_result(r);
 }
 
+/* The name member of a clientInfo object into the instance, decoded there:
+ * the message itself is left as it arrived. */
+static void keep_client(tinymcp_t *t, const tinymcp_jv_t *info)
+{
+    tinymcp_jv_t name;
+    size_t n;
+
+    t->client[0] = 0;
+    if (info->type != TINYMCP_J_OBJECT ||
+        tinymcp_json_get(info, "name", &name) != 1 ||
+        name.type != TINYMCP_J_STRING)
+        return;
+    n = name.len < TINYMCP_CLIENT_MAX - 1 ? name.len : TINYMCP_CLIENT_MAX - 1;
+    /* A cut inside an escape does not decode; a shorter cut does. */
+    for (; n > 0; n--) {
+        memcpy(t->client, name.at, n);
+        if (tinymcp_json_decode(t->client, n) >= 0)
+            return;
+    }
+    t->client[0] = 0;
+}
+
 static void do_initialize(req_t *r)
 {
     tinymcp_jw_t *w = &r->w;
@@ -479,6 +502,8 @@ static void do_initialize(req_t *r)
     const char *version = legacy_versions[0];
     size_t i;
 
+    if (param(r, "clientInfo", &v))
+        keep_client(r->t, &v);
     if (param(r, "protocolVersion", &v) && v.type == TINYMCP_J_STRING) {
         for (i = 0; i < N_LEGACY; i++)
             if (tinymcp_json_is(&v, legacy_versions[i]))
@@ -1371,6 +1396,11 @@ static void process(tinymcp_t *t, char *msg, size_t len)
             goto out;
         }
         r.modern = 1;
+        /* Each request names its own client in this revision. */
+        if (tinymcp_json_get(&meta, META_CLI, &v) == 1)
+            keep_client(t, &v);
+        else
+            t->client[0] = 0;
     }
     dispatch(&r);
 out:
@@ -1519,6 +1549,7 @@ void tinymcp_closed(tinymcp_t *t)
             slot_clear(t, i);
     t->era = TINYMCP_ERA_NONE;
     t->legacy_version = NULL;
+    t->client[0] = 0;
     t->in_len = 0;
     t->in_drop = 0;
     t->pending = 0;
@@ -1535,6 +1566,11 @@ const char *tinymcp_era_name(const tinymcp_t *t)
     default:
         return "none";
     }
+}
+
+const char *tinymcp_client(const tinymcp_t *t)
+{
+    return t->client;
 }
 
 const char *tinymcp_arg_str(const tinymcp_args_t *args, const char *key)

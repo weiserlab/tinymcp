@@ -1,5 +1,5 @@
 /*
- * tinymcp v0.2
+ * tinymcp v0.3
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
@@ -158,6 +158,8 @@ static const tinymcp_tool_t tools[] = {
     { "echo", "Return the text given.",
       "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},"
       "\"required\":[\"text\"]}" },
+    { "whoami", "Return the name the client gave in its clientInfo.",
+      "{\"type\":\"object\"}" },
 };
 
 static const tinymcp_template_t templates[] = {
@@ -276,6 +278,10 @@ static int call(void *ctx, const char *name, const tinymcp_args_t *args,
         if (!s)
             return TINYMCP_EINVAL;
         tinymcp_sink_puts(text, s);
+        return TINYMCP_OK;
+    }
+    if (!strcmp(name, "whoami")) {
+        tinymcp_sink_puts(text, tinymcp_client(&server));
         return TINYMCP_OK;
     }
     if (!strcmp(name, "shell")) {

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# tinymcp v0.2
+# tinymcp v0.3
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
@@ -8,8 +8,8 @@
 #
 # board_smoke.py - the official mcp SDK client against a tikuOS board
 # through the bridge: discover, list, read a node, write the LED, subscribe
-# and see the change, run a shell line, get a prompt the board holds and
-# complete a path.  Both eras.  Every check prints one
+# and see the change, run a shell line, get a prompt the board holds,
+# complete a path, and hear the board ask and answer it.  Both eras.  Every check prints one
 # "CHECK <era> <key> ok|fail <detail>" line, which TikuBench's suite reads.
 #
 # SPDX-License-Identifier: Apache-2.0
@@ -30,7 +30,9 @@ KEYS = ["protocol", "identity", "tools", "read", "read-tool", "list",
         "commands", "page", "ls", "write", "led", "shell", "mode-refused",
         "write-missing", "read-missing", "subscribe", "update", "status",
         "prompts", "prompt-get", "prompt-missing", "prompts-changed",
-        "complete", "complete-root"]
+        "complete", "complete-root", "ask-heard", "answer", "answer-stale",
+        "journal"]
+CLIENT = "board-smoke"
 
 PROMPT = "/data/prompt.smoke"
 PROMPT_TEXT = "Smoke test for {{who}}\nSay hi to {{who}} from {{where}}.\n"
@@ -67,7 +69,8 @@ async def run(mode, port):
 
     params = StdioServerParameters(command=sys.executable, args=[BRIDGE, port])
     async with Client(params, mode=mode, message_handler=handler,
-                      read_timeout_seconds=20, cache=None) as c:
+                      read_timeout_seconds=20, cache=None,
+                      client_info=types.Implementation(name=CLIENT, version="1")) as c:
         want = "2025-11-25" if mode == "legacy" else "2026-07-28"
         expect("protocol", c.protocol_version == want, f"protocol {c.protocol_version}")
         # serverInfo is the board: its name, the device model, the OS version.
@@ -135,6 +138,7 @@ async def run(mode, port):
                        f"event {ev}")
         await prompts(c, mode, seen)
         await completion(c)
+        await asks(c, mode, seen)
         r = await c.call_tool("shell", {"line": "mcp"})
         status = text_of(r).strip().replace("\n", " | ")
         expect("status", "tinymcp" in status and "requests" in status, status)
@@ -174,6 +178,51 @@ async def prompts(c, mode, seen):
                 ev = None
             expect("prompts-changed", sub.honored.prompts_list_changed is True and
                    isinstance(ev, PromptsListChanged), f"event {ev}")
+
+
+QUESTION = "tiku:///sys/mcp/ask/question"
+
+
+async def asks(c, mode, seen):
+    """The board asks through the shell's ask; the agent hears and answers."""
+    async def ask_and_hear():
+        r = await c.call_tool("shell", {"line": "ask Which colour, " + mode + "?"})
+        return text_of(r)
+
+    if mode == "legacy":
+        await c.subscribe_resource(QUESTION)
+        seen.clear()
+        said = await ask_and_hear()
+        await anyio.sleep(0.5)
+        heard = QUESTION in seen
+        await c.unsubscribe_resource(QUESTION)
+    else:
+        async with c.listen(resource_subscriptions=[QUESTION]) as sub:
+            said = await ask_and_hear()
+            try:
+                with anyio.fail_after(5):
+                    ev = await sub.__anext__()
+            except TimeoutError:
+                ev = None
+            heard = isinstance(ev, ResourceUpdated) and ev.uri == QUESTION
+    q = (await c.read_resource(QUESTION)).contents[0].text.strip()
+    expect("ask-heard", heard and said.startswith("asked #") and
+           q == "Which colour, " + mode + "?", f"{said.strip()!r}; question {q!r}")
+
+    seq = said.strip()[len("asked #"):]
+    r = await c.call_tool("write", {"path": "/sys/mcp/ask/answer", "value": f"#{seq} blue"})
+    state = (await c.read_resource("tiku:///sys/mcp/ask/state")).contents[0].text.strip()
+    who = (await c.read_resource("tiku:///sys/mcp/ask/answered_by")).contents[0].text.strip()
+    expect("answer", not r.is_error and state == "answered" and who == CLIENT,
+           f"state {state!r}, answered_by {who!r}")
+    r1 = await c.call_tool("write", {"path": "/sys/mcp/ask/answer", "value": "again"})
+    r2 = await c.call_tool("write", {"path": "/sys/mcp/ask/answer", "value": "#0 old"})
+    expect("answer-stale", r1.is_error and r2.is_error and "EINVAL" in text_of(r2),
+           f"a second answer {text_of(r1)!r}; an old question's {text_of(r2)!r}")
+    j = (await c.read_resource("tiku:///sys/mcp/journal")).contents[0].text
+    expect("journal", f"{CLIENT} asked #{seq}: Which colour" in j and
+           f"{CLIENT} answered #{seq}: blue" in j,
+           " | ".join(j.splitlines()[-3:]))
 
 
 async def completion(c):

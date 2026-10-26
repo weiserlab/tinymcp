@@ -20,6 +20,19 @@ what the binding maps, so another host can take the same shape.
 | `watch`, `unwatch` | `tiku_vfs_watch` into the tinymcp process; `TIKU_EVENT_VFS` becomes `tinymcp_updated(slot)` |
 | `prompt_list`, `prompt_get` | `/data/prompt.<name>` files: the first line describes, `{{argument}}` places are the arguments, `tinymcp_render` fills them |
 | `complete` | a `path` argument against the namespace, through `tiku_vfs_list` |
+
+## The board asks
+
+`/sys/mcp/ask/` holds one question at a time: `question` (written by the
+`ask` shell command, a rule whose action is `ask ...`, BASIC's
+`ASK q$, A$[, seconds]`, or any writer), `answer` (written by a client;
+a leading `#<seq> ` names the question it answers, and an answer to an
+older one is refused), `seq`, `state` (`idle`, `asked`, `answered`),
+`asked_by` and `answered_by`.  A writer is the client's name from
+`tinymcp_client()` while one of its tools runs, `board` otherwise.
+`/sys/mcp/journal` is a RAM ring of the last 16 entries, `<seconds> <who>
+<what>`: questions, answers, the `write` and `shell` tools, and whatever a
+client writes there.
 | `send` | one console frame on channel `0xF3`, or `tcp_send` from the pump |
 
 ## Streams

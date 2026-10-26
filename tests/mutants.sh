@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# tinymcp v0.2
+# tinymcp v0.3
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
@@ -78,6 +78,11 @@ mutate prompts-pending tinymcp.c 's/        t->pending_lc |= TINYMCP_LC_PROMPTS;
 mutate render-unchecked tinymcp.c 's/        if (k \&\& !arg_strn(args, text + i + 2, k))/        if (0)/'
 mutate placeholder-long tinymcp.c 's/i - 2 < TINYMCP_PNAME_MAX - 1 \&\&/i - 2 < TINYMCP_PNAME_MAX \&\&/'
 mutate placeholder-dup tinymcp.c 's/        if (j == count \&\& count < max) {/        if (count < max) {/'
+
+mutate client-per-request tinymcp.c 's/            t->client\[0\] = 0;$/            ;/'
+mutate client-legacy tinymcp.c 's/    if (param(r, "clientInfo", \&v))/    if (0)/'
+mutate client-cut tinymcp.c 's/        if (tinymcp_json_decode(t->client, n) >= 0)/        if (1)/'
+mutate client-closed tinymcp.c '/    t->legacy_version = NULL;/{n;s/    t->client\[0\] = 0;/    ;/;}'
 
 echo "$total mutants, $survived survived"
 [ "$survived" -eq 0 ]

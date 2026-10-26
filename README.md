@@ -22,6 +22,7 @@ tinymcp.h, tinymcp.c            the server: eras, methods, errors, subscriptions
 tinymcp_json.h, tinymcp_json.c  the scanner, in-place decoding, the bounded writer
 examples/posix/                 a server over stdio: a directory as resources and prompts, a shell tool
 bridge/tinymcp.py               an MCP client's stdio to a device's serial port or TCP port
+bridge/attend.py                answers a board's questions from the Anthropic API, opt-in
 tests/                          the protocol against a fake host; mutants; the SDK; the bridge
 ports/                          what each host maps
 hygiene/                        the commit and style checks
@@ -29,9 +30,9 @@ hygiene/                        the commit and style checks
 
 | Measured on 2026-10-26 | |
 |---|---|
-| code, `-Os`, Cortex-M33 (`make size`) | 13.5 KB (`tinymcp.c` 11.5 KB, `tinymcp_json.c` 2.1 KB) |
-| code, `-Os`, Cortex-M0+ | 13.5 KB |
-| one instance, `tinymcp_t`, four subscription slots, Cortex-M33 | 616 bytes |
+| code, `-Os`, Cortex-M33 (`make size`) | 13.7 KB (`tinymcp.c` 11.7 KB, `tinymcp_json.c` 2.1 KB) |
+| code, `-Os`, Cortex-M0+ | 13.7 KB |
+| one instance, `tinymcp_t`, four subscription slots, Cortex-M33 | 648 bytes |
 | stack during a tool call | about 1 KB (the argument table) |
 | buffers | the host's: the in buffer holds one request, the out buffer one reply |
 
@@ -87,7 +88,9 @@ reports the rest in `total` and `hasMore`.
 
 `name`, `title` and `version` are the host's `serverInfo`; the library
 names itself in the `org.tinymcp/library` member of the `_meta` of the
-discover and initialize results.
+discover and initialize results.  `tinymcp_client()` is the name the
+client gave in its `clientInfo`, during a request: from `initialize` for
+the handshake era, from each request's `_meta` for the current revision.
 
 A tool writes its output through `tinymcp_sink_putc()`, so a shell whose
 output function takes a character can be pointed at the reply directly.
@@ -131,6 +134,23 @@ The bridge keeps no protocol state.  When its stdin closes it sends
 `notifications/cancelled` for every `subscriptions/listen` it relayed,
 since the device has no connection to see close.
 
+## Answering a board
+
+A tikuOS board asks through `/sys/mcp/ask/question`, and any subscribed
+client answers by writing `/sys/mcp/ask/answer`.  For a board left with
+no agent attached, `bridge/attend.py` is that client: started by the owner
+with `ANTHROPIC_API_KEY` in its environment, it sends each question to the
+Messages API and writes the reply back, one line cut to fit.  The model is
+told the board's instructions and the names of its prompts, nothing else;
+`--max-tokens` (1000) bounds each reply and `--per-hour` (20) the
+questions, past which the answer is a refusal; the model and the tokens of
+every exchange go into the board's `/sys/mcp/journal`.  The bridge itself
+never carries a key.
+
+```
+ANTHROPIC_API_KEY=... python3 bridge/attend.py /dev/cu.usbmodem1101
+```
+
 ## Building and proving
 
 ```
@@ -139,6 +159,7 @@ make test            # the protocol against a fake host, under the sanitizers
 make mutants         # each check fails on a build that breaks what it guards
 make conformance     # the official mcp SDK client in three modes, in .venv
 make test-bridge     # the bridge against a fake device on a pty and a socket
+make test-attend     # attend.py against a stub of the Messages API
 make check           # all of the above
 make size            # code size on a Cortex-M33 (arm-none-eabi-gcc)
 make lint            # comment and prose style over the tracked files
