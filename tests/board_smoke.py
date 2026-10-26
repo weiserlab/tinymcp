@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# tinymcp v0.1
+# tinymcp v0.2
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
@@ -8,7 +8,8 @@
 #
 # board_smoke.py - the official mcp SDK client against a tikuOS board
 # through the bridge: discover, list, read a node, write the LED, subscribe
-# and see the change, run a shell line.  Both eras.  Every check prints one
+# and see the change, run a shell line, get a prompt the board holds and
+# complete a path.  Both eras.  Every check prints one
 # "CHECK <era> <key> ok|fail <detail>" line, which TikuBench's suite reads.
 #
 # SPDX-License-Identifier: Apache-2.0
@@ -20,14 +21,19 @@ import anyio
 import mcp_types as types
 from mcp import Client, MCPError
 from mcp.client.stdio import StdioServerParameters
-from mcp.shared.subscriptions import ResourceUpdated
+from mcp.shared.subscriptions import PromptsListChanged, ResourceUpdated
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BRIDGE = os.path.join(HERE, "..", "bridge", "tinymcp.py")
 
 KEYS = ["protocol", "identity", "tools", "read", "read-tool", "list",
         "commands", "page", "ls", "write", "led", "shell", "mode-refused",
-        "write-missing", "read-missing", "subscribe", "update", "status"]
+        "write-missing", "read-missing", "subscribe", "update", "status",
+        "prompts", "prompt-get", "prompt-missing", "prompts-changed",
+        "complete", "complete-root"]
+
+PROMPT = "/data/prompt.smoke"
+PROMPT_TEXT = "Smoke test for {{who}}\nSay hi to {{who}} from {{where}}.\n"
 
 failures = 0
 checks = 0
@@ -54,6 +60,8 @@ async def run(mode, port):
     async def handler(msg):
         if isinstance(msg, types.ResourceUpdatedNotification):
             seen.append(msg.params.uri)
+        elif isinstance(msg, types.PromptListChangedNotification):
+            seen.append("prompts")
         elif isinstance(msg, Exception):
             seen.append(repr(msg))
 
@@ -62,14 +70,15 @@ async def run(mode, port):
                       read_timeout_seconds=20, cache=None) as c:
         want = "2025-11-25" if mode == "legacy" else "2026-07-28"
         expect("protocol", c.protocol_version == want, f"protocol {c.protocol_version}")
-        if mode == "legacy":
-            expect("identity", c.server_info.name == "tinymcp" and "tikuOS" in (c.instructions or ""),
-                   f"serverInfo {c.server_info.name} {c.server_info.version}; "
-                   f"instructions {(c.instructions or '')[:40]!r}")
-        else:
-            d = types.DiscoverResult.model_validate(await c.session.send_discover("2026-07-28"))
-            expect("identity", "2026-07-28" in d.supported_versions and "tikuOS" in (d.instructions or ""),
-                   f"supported {d.supported_versions[:2]}; instructions {(d.instructions or '')[:40]!r}")
+        # serverInfo is the board: its name, the device model, the OS version.
+        r = await c.call_tool("read", {"path": "/sys/device/name"})
+        name = text_of(r).strip()
+        si = c.server_info
+        expect("identity", si is not None and si.name == name and
+               (si.title or "").startswith("tikuOS on ") and si.version and
+               "tikuOS" in (c.instructions or ""),
+               f"serverInfo {si.name if si else None!r} {si.title if si else None!r} "
+               f"{si.version if si else None!r}; board name {name!r}")
         tools = await c.list_tools()
         names = sorted(t.name for t in tools.tools)
         expect("tools", names == ["ls", "read", "shell", "write"], f"tools {names}")
@@ -124,9 +133,59 @@ async def run(mode, port):
                     ev = None
                 expect("update", isinstance(ev, ResourceUpdated) and ev.uri == "tiku:///dev/led0",
                        f"event {ev}")
+        await prompts(c, mode, seen)
+        await completion(c)
         r = await c.call_tool("shell", {"line": "mcp"})
         status = text_of(r).strip().replace("\n", " | ")
         expect("status", "tinymcp" in status and "requests" in status, status)
+
+
+async def prompts(c, mode, seen):
+    """A prompt the owner wrote to /data: listed, got, refused, and heard."""
+    r = await c.call_tool("write", {"path": PROMPT, "value": PROMPT_TEXT})
+    p = await c.list_prompts()
+    smoke = next((x for x in p.prompts if x.name == "smoke"), None)
+    expect("prompts", not r.is_error and smoke is not None and
+           smoke.description == "Smoke test for {{who}}" and
+           [(a.name, a.required) for a in smoke.arguments or []] ==
+           [("who", True), ("where", True)],
+           f"{[x.name for x in p.prompts]}; smoke {smoke}")
+    g = await c.get_prompt("smoke", {"who": "Ada", "where": "the board"})
+    text = g.messages[0].content.text if g.messages else ""
+    expect("prompt-get", text == "Smoke test for Ada\nSay hi to Ada from the board.\n",
+           f"{text!r}")
+    try:
+        await c.get_prompt("smoke", {"who": "Ada"})
+        expect("prompt-missing", False, "a missing argument accepted")
+    except MCPError as e:
+        expect("prompt-missing", e.error.code == -32602, f"code {e.error.code}")
+    if mode == "legacy":
+        seen.clear()
+        await c.call_tool("shell", {"line": "rm " + PROMPT})
+        await anyio.sleep(0.5)
+        expect("prompts-changed", "prompts" in seen, f"notifications {seen}")
+    else:
+        async with c.listen(prompts_list_changed=True) as sub:
+            await c.call_tool("shell", {"line": "rm " + PROMPT})
+            try:
+                with anyio.fail_after(5):
+                    ev = await sub.__anext__()
+            except TimeoutError:
+                ev = None
+            expect("prompts-changed", sub.honored.prompts_list_changed is True and
+                   isinstance(ev, PromptsListChanged), f"event {ev}")
+
+
+async def completion(c):
+    """Paths complete against the namespace, through the node template."""
+    ref = types.ResourceTemplateReference(uri="tiku:///{+path}")
+    r = await c.complete(ref, {"name": "path", "value": "dev/le"})
+    expect("complete", "dev/led0" in r.completion.values and
+           all(v.startswith("dev/le") for v in r.completion.values),
+           f"dev/le: {r.completion.values}")
+    r = await c.complete(ref, {"name": "path", "value": ""})
+    expect("complete-root", "sys/" in r.completion.values and "dev/" in r.completion.values,
+           f"root: {r.completion.values}")
 
 
 async def main(port, modes):

@@ -1,5 +1,5 @@
 /*
- * tinymcp v0.1
+ * tinymcp v0.2
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
@@ -24,8 +24,8 @@
 extern "C" {
 #endif
 
-#define TINYMCP_VERSION  "0.1.0"
-#define TINYMCP_API      1             /* bumped on any change to tinymcp_host_t */
+#define TINYMCP_VERSION  "0.2.0"
+#define TINYMCP_API      2             /* bumped on any change to tinymcp_host_t */
 #define TINYMCP_PROTOCOL "2026-07-28"  /* the newest revision served */
 
 #ifndef TINYMCP_SUBS_MAX
@@ -38,8 +38,9 @@ extern "C" {
 #define TINYMCP_ID_MAX 32     /* a listen request's id as sent, with terminator */
 #endif
 #ifndef TINYMCP_ARGS_MAX
-#define TINYMCP_ARGS_MAX 8    /* tool arguments kept; later ones are dropped */
+#define TINYMCP_ARGS_MAX 8    /* tool or prompt arguments kept; later ones are dropped */
 #endif
+#define TINYMCP_COMPLETE_MAX 100   /* completion values in one reply, the spec's cap */
 
 /* What a host function returns. */
 #define TINYMCP_OK          0
@@ -91,7 +92,27 @@ long tinymcp_arg_int(const tinymcp_args_t *args, const char *key, long dflt);
 /** dflt unless the argument is present and true or false. */
 int tinymcp_arg_bool(const tinymcp_args_t *args, const char *key, int dflt);
 
-/** The resources/list reply under construction. */
+#define TINYMCP_PNAME_MAX 32   /* a {{name}} placeholder's name, with its terminator */
+
+/**
+ * The {{name}} placeholders of a prompt template, each name once, in the
+ * order of first use, at most max of them.  A name is letters, digits and
+ * '_', up to TINYMCP_PNAME_MAX - 1 of them; any other {{ is text.
+ * @return the number of names written.
+ */
+unsigned tinymcp_placeholders(const char *text, size_t len,
+                              char names[][TINYMCP_PNAME_MAX], unsigned max);
+
+/**
+ * Write a prompt template into the sink with each {{name}} replaced by the
+ * string argument of that name.
+ * @return 0, or TINYMCP_EINVAL, with nothing written, when a placeholder
+ *         has no string argument.
+ */
+int tinymcp_render(tinymcp_sink_t *sink, const char *text, size_t len,
+                   const tinymcp_args_t *args);
+
+/** The resources/list or prompts/list reply under construction. */
 typedef struct tinymcp_list {
     tinymcp_jw_t *w;
     size_t limit;
@@ -106,10 +127,42 @@ typedef struct tinymcp_list {
 int tinymcp_list_add(tinymcp_list_t *list, const char *uri, const char *name,
                      const char *description);
 
+/** One argument a prompt takes; description may be NULL. */
+typedef struct tinymcp_prompt_arg {
+    const char *name;
+    const char *description;
+    unsigned char required;
+} tinymcp_prompt_arg_t;
+
 /**
- * What the host provides.  Strings are kept by pointer and must outlive the
- * instance.  A NULL resource_list serves no resources; a NULL watch serves
- * no subscriptions.
+ * Add one prompt entry to a prompts/list reply, with nargs arguments;
+ * description may be NULL.
+ * @return 0, or TINYMCP_EFULL as for tinymcp_list_add().
+ */
+int tinymcp_prompt_add(tinymcp_list_t *list, const char *name,
+                       const char *description,
+                       const tinymcp_prompt_arg_t *args, unsigned nargs);
+
+/** The completion/complete reply under construction. */
+typedef struct tinymcp_completion {
+    tinymcp_jw_t *w;
+    size_t limit;
+    unsigned count;    /* values in the reply */
+    unsigned offered;  /* values the host offered, kept or not */
+} tinymcp_completion_t;
+
+/**
+ * Offer one completion value.  The reply keeps the first
+ * TINYMCP_COMPLETE_MAX that fit and reports the rest through total and
+ * hasMore.
+ * @return 0, or TINYMCP_EFULL when this value was not kept.
+ */
+int tinymcp_complete_add(tinymcp_completion_t *c, const char *value);
+
+/**
+ * What the host provides.  Strings are kept by pointer, outlive the instance
+ * and are read again for each reply.  A NULL resource_list, watch, prompt_list
+ * or complete serves no resources, subscriptions, prompts or completion.
  */
 typedef struct tinymcp_host {
     const char *name;          /* serverInfo.name */
@@ -147,14 +200,39 @@ typedef struct tinymcp_host {
     void (*unwatch)(void *ctx, unsigned slot);
     /* One whole message without a trailing newline; nonzero means not sent. */
     int (*send)(void *ctx, const char *msg, size_t len);
+    const char *title;         /* serverInfo.title; may be NULL */
+    /*
+     * Add prompts from cursor on with tinymcp_prompt_add(); returns as
+     * resource_list does.
+     */
+    int (*prompt_list)(void *ctx, unsigned cursor, tinymcp_list_t *list);
+    /*
+     * Write the prompt's text, its arguments substituted, into the sink; it
+     * becomes one user message.  TINYMCP_ENOENT for no such prompt,
+     * TINYMCP_EINVAL for a required argument missing, or 0.
+     */
+    int (*prompt_get)(void *ctx, const char *name, const tinymcp_args_t *args,
+                      tinymcp_sink_t *text);
+    /*
+     * Offer completions with tinymcp_complete_add() for the argument arg,
+     * typed so far as value, of the prompt named ref (is_prompt) or of the
+     * resource template ref; context holds the arguments already chosen.
+     * TINYMCP_ENOENT for an unknown prompt or template, or 0.
+     */
+    int (*complete)(void *ctx, int is_prompt, const char *ref, const char *arg,
+                    const char *value, const tinymcp_args_t *context,
+                    tinymcp_completion_t *c);
 } tinymcp_host_t;
+
+#define TINYMCP_LC_RESOURCES 1u   /* listchanged: resources/list_changed */
+#define TINYMCP_LC_PROMPTS   2u   /* listchanged: prompts/list_changed */
 
 typedef struct tinymcp_sub {
     char uri[TINYMCP_URI_MAX];   /* empty: a list-changed listen alone */
     char id[TINYMCP_ID_MAX];     /* the listen request's id as sent; empty: legacy */
     unsigned seq;
     unsigned char used;
-    unsigned char listchanged;
+    unsigned char listchanged;   /* TINYMCP_LC_* bits */
 } tinymcp_sub_t;
 
 /** One server instance: one stream, one request in flight. */
@@ -174,7 +252,7 @@ typedef struct tinymcp {
     const char *legacy_version; /* the version initialize settled on */
     unsigned char busy;         /* inside a request: notifications wait */
     unsigned pending;           /* slots whose update waits, one bit each */
-    unsigned char pending_lc;
+    unsigned char pending_lc;   /* TINYMCP_LC_* notices that wait */
     unsigned requests;
     unsigned errors;
     unsigned dropped;           /* messages send() refused */
@@ -215,6 +293,9 @@ void tinymcp_updated(tinymcp_t *t, unsigned slot);
 
 /** The set of resources changed: notifications/resources/list_changed. */
 void tinymcp_listchanged(tinymcp_t *t);
+
+/** The set of prompts changed: notifications/prompts/list_changed. */
+void tinymcp_prompts_changed(tinymcp_t *t);
 
 /** The transport is gone: subscriptions end and the era is forgotten. */
 void tinymcp_closed(tinymcp_t *t);

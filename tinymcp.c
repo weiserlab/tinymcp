@@ -1,5 +1,5 @@
 /*
- * tinymcp v0.1
+ * tinymcp v0.2
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
@@ -8,6 +8,8 @@
  * tinymcp.c - one message in, one reply out.  A request carrying
  * _meta.protocolVersion is served statelessly; initialize switches the
  * stream to the handshake era; subscriptions live in the instance's slots.
+ * Tools, resources, prompts and completion are the host's, through its
+ * table.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -20,6 +22,7 @@
 #define META_CAPS "io.modelcontextprotocol/clientCapabilities"
 #define META_SUB  "io.modelcontextprotocol/subscriptionId"
 #define META_SRV  "io.modelcontextprotocol/serverInfo"
+#define META_LIB  "org.tinymcp/library"
 
 /* Room kept after a page or a text for the closing envelope. */
 #define TAIL_RESERVE 80
@@ -69,12 +72,24 @@ static void server_info(tinymcp_jw_t *w, const tinymcp_host_t *h)
     tinymcp_jw_raw(w, "{");
     tinymcp_jw_key(w, "name");
     tinymcp_jw_str(w, h->name);
+    if (h->title) {
+        tinymcp_jw_key(w, "title");
+        tinymcp_jw_str(w, h->title);
+    }
     tinymcp_jw_key(w, "version");
     tinymcp_jw_str(w, h->version);
     tinymcp_jw_raw(w, "}");
 }
 
-static void begin_result(req_t *r)
+/* The library's name and version, as a _meta member. */
+static void library_meta(tinymcp_jw_t *w)
+{
+    tinymcp_jw_key(w, META_LIB);
+    tinymcp_jw_str(w, "tinymcp " TINYMCP_VERSION);
+}
+
+/* The result's opening; library adds the library's _meta member. */
+static void begin_result_with(req_t *r, int library)
 {
     tinymcp_jw_t *w = &r->w;
 
@@ -86,8 +101,20 @@ static void begin_result(req_t *r)
         tinymcp_jw_raw(w, "\"resultType\":\"complete\",\"_meta\":{\"" META_SRV
                           "\":");
         server_info(w, r->t->host);
+        if (library)
+            library_meta(w);
+        tinymcp_jw_raw(w, "}");
+    } else if (library) {
+        tinymcp_jw_key(w, "_meta");
+        tinymcp_jw_raw(w, "{");
+        library_meta(w);
         tinymcp_jw_raw(w, "}");
     }
+}
+
+static void begin_result(req_t *r)
+{
+    begin_result_with(r, 0);
 }
 
 static void error_reply(req_t *r, long code, const char *message);
@@ -177,6 +204,14 @@ static void capabilities(req_t *r)
         tinymcp_jw_key(w, "listChanged");
         tinymcp_jw_raw(w, "true");
         tinymcp_jw_raw(w, "}");
+    }
+    if (h->prompt_list) {
+        tinymcp_jw_key(w, "prompts");
+        tinymcp_jw_raw(w, "{\"listChanged\":true}");
+    }
+    if (h->complete) {
+        tinymcp_jw_key(w, "completions");
+        tinymcp_jw_raw(w, "{}");
     }
     tinymcp_jw_raw(w, "}");
 }
@@ -289,26 +324,32 @@ static void notify_updated(tinymcp_t *t, unsigned slot)
     emit(t, &w);
 }
 
-static void notify_listchanged(tinymcp_t *t)
+/* A list_changed notice of one kind (TINYMCP_LC_*) to every listen that
+ * asked for it, and to the stream when it is in the handshake era. */
+static void notify_listchanged(tinymcp_t *t, unsigned kind)
 {
+    const char *method = kind == TINYMCP_LC_PROMPTS
+                             ? "notifications/prompts/list_changed"
+                             : "notifications/resources/list_changed";
     tinymcp_jw_t w;
     unsigned i;
 
     for (i = 0; i < t->max_subs; i++) {
-        if (!t->subs[i].used || !t->subs[i].listchanged)
+        if (!t->subs[i].used || !(t->subs[i].listchanged & kind))
             continue;
         tinymcp_jw_init(&w, t->out, t->out_cap);
-        tinymcp_jw_raw(&w, "{\"jsonrpc\":\"2.0\",\"method\":"
-                           "\"notifications/resources/list_changed\","
-                           "\"params\":{\"_meta\":{\"" META_SUB "\":");
+        tinymcp_jw_raw(&w, "{\"jsonrpc\":\"2.0\",\"method\":\"");
+        tinymcp_jw_raw(&w, method);
+        tinymcp_jw_raw(&w, "\",\"params\":{\"_meta\":{\"" META_SUB "\":");
         tinymcp_jw_raw(&w, t->subs[i].id);
         tinymcp_jw_raw(&w, "}}}");
         emit(t, &w);
     }
     if (t->era == TINYMCP_ERA_LEGACY) {
         tinymcp_jw_init(&w, t->out, t->out_cap);
-        tinymcp_jw_raw(&w, "{\"jsonrpc\":\"2.0\",\"method\":"
-                           "\"notifications/resources/list_changed\"}");
+        tinymcp_jw_raw(&w, "{\"jsonrpc\":\"2.0\",\"method\":\"");
+        tinymcp_jw_raw(&w, method);
+        tinymcp_jw_raw(&w, "\"}");
         emit(t, &w);
     }
 }
@@ -327,8 +368,13 @@ static void flush_pending(tinymcp_t *t)
         }
     }
     if (t->pending_lc) {
+        unsigned kinds = t->pending_lc;
+
         t->pending_lc = 0;
-        notify_listchanged(t);
+        if (kinds & TINYMCP_LC_RESOURCES)
+            notify_listchanged(t, TINYMCP_LC_RESOURCES);
+        if (kinds & TINYMCP_LC_PROMPTS)
+            notify_listchanged(t, TINYMCP_LC_PROMPTS);
     }
 }
 
@@ -414,7 +460,7 @@ static void do_discover(req_t *r)
 {
     tinymcp_jw_t *w = &r->w;
 
-    begin_result(r);
+    begin_result_with(r, 1);
     tinymcp_jw_key(w, "supportedVersions");
     versions_array(w);
     capabilities(r);
@@ -440,7 +486,7 @@ static void do_initialize(req_t *r)
     }
     r->t->era = TINYMCP_ERA_LEGACY;
     r->t->legacy_version = version;
-    begin_result(r);
+    begin_result_with(r, 1);
     tinymcp_jw_key(w, "protocolVersion");
     tinymcp_jw_str(w, version);
     capabilities(r);
@@ -567,6 +613,19 @@ static void do_templates_list(req_t *r)
     end_result(r);
 }
 
+/* Keep the entry written since mark when it fits the page; else drop it. */
+static int list_fit(tinymcp_list_t *list, size_t mark)
+{
+    tinymcp_jw_t *w = list->w;
+
+    if (w->full || w->len > list->limit) {
+        tinymcp_jw_reset(w, mark);
+        return TINYMCP_EFULL;
+    }
+    list->count++;
+    return 0;
+}
+
 int tinymcp_list_add(tinymcp_list_t *list, const char *uri, const char *name,
                      const char *description)
 {
@@ -586,18 +645,52 @@ int tinymcp_list_add(tinymcp_list_t *list, const char *uri, const char *name,
     tinymcp_jw_key(w, "mimeType");
     tinymcp_jw_str(w, "text/plain");
     tinymcp_jw_raw(w, "}");
-    if (w->full || w->len > list->limit) {
-        tinymcp_jw_reset(w, mark);
-        return TINYMCP_EFULL;
-    }
-    list->count++;
-    return 0;
+    return list_fit(list, mark);
 }
 
-static void do_resources_list(req_t *r)
+int tinymcp_prompt_add(tinymcp_list_t *list, const char *name,
+                       const char *description,
+                       const tinymcp_prompt_arg_t *args, unsigned nargs)
+{
+    tinymcp_jw_t *w = list->w;
+    size_t mark = w->len;
+    unsigned i;
+
+    tinymcp_jw_sep(w);
+    tinymcp_jw_raw(w, "{");
+    tinymcp_jw_key(w, "name");
+    tinymcp_jw_str(w, name);
+    if (description) {
+        tinymcp_jw_key(w, "description");
+        tinymcp_jw_str(w, description);
+    }
+    if (nargs) {
+        tinymcp_jw_key(w, "arguments");
+        tinymcp_jw_raw(w, "[");
+        for (i = 0; i < nargs; i++) {
+            tinymcp_jw_sep(w);
+            tinymcp_jw_raw(w, "{");
+            tinymcp_jw_key(w, "name");
+            tinymcp_jw_str(w, args[i].name);
+            if (args[i].description) {
+                tinymcp_jw_key(w, "description");
+                tinymcp_jw_str(w, args[i].description);
+            }
+            tinymcp_jw_key(w, "required");
+            tinymcp_jw_raw(w, args[i].required ? "true" : "false");
+            tinymcp_jw_raw(w, "}");
+        }
+        tinymcp_jw_raw(w, "]");
+    }
+    tinymcp_jw_raw(w, "}");
+    return list_fit(list, mark);
+}
+
+/* A paged list from the host's lister fn under key: resources or prompts. */
+static void do_host_list(req_t *r, const char *key,
+                         int (*fn)(void *, unsigned, tinymcp_list_t *))
 {
     tinymcp_jw_t *w = &r->w;
-    const tinymcp_host_t *h = r->t->host;
     long cursor = param_cursor(r);
     tinymcp_list_t list;
     int next = 0;
@@ -607,15 +700,15 @@ static void do_resources_list(req_t *r)
         return;
     }
     begin_result(r);
-    tinymcp_jw_key(w, "resources");
+    tinymcp_jw_key(w, key);
     tinymcp_jw_raw(w, "[");
     list.w = w;
     list.limit = r->t->out_cap - TAIL_RESERVE;
     list.count = 0;
-    if (h->resource_list)
-        next = h->resource_list(r->t->ctx, (unsigned)cursor, &list);
+    if (fn)
+        next = fn(r->t->ctx, (unsigned)cursor, &list);
     if (next == TINYMCP_EFULL || (next > 0 && list.count == 0)) {
-        error_reply(r, -32603, "a resource entry does not fit the out buffer");
+        error_reply(r, -32603, "an entry does not fit the out buffer");
         return;
     }
     if (next < 0) {
@@ -631,6 +724,16 @@ static void do_resources_list(req_t *r)
     }
     cacheable(r, TTL_LIVE);
     end_result(r);
+}
+
+static void do_resources_list(req_t *r)
+{
+    do_host_list(r, "resources", r->t->host->resource_list);
+}
+
+static void do_prompts_list(req_t *r)
+{
+    do_host_list(r, "prompts", r->t->host->prompt_list);
 }
 
 /* A host code into the reply; 1 when it was an error and the reply is sent. */
@@ -694,22 +797,26 @@ static void do_resources_read(req_t *r)
     end_result(r);
 }
 
-/* Collect the arguments object, then decode its strings in place. */
-static int collect_args(req_t *r, tinymcp_args_t *args)
+/*
+ * Collect an arguments object, then decode its strings in place; obj absent
+ * (TINYMCP_J_NONE) is no arguments.  Nothing that encloses obj may be
+ * scanned afterwards.
+ */
+static int collect_object(const tinymcp_jv_t *obj, tinymcp_args_t *args)
 {
-    tinymcp_jv_t obj, k, v;
+    tinymcp_jv_t k, v;
     tinymcp_jv_t keys[TINYMCP_ARGS_MAX], vals[TINYMCP_ARGS_MAX];
     size_t pos = 0;
     unsigned i;
     int rc;
 
     args->n = 0;
-    if (!param(r, "arguments", &obj))
+    if (obj->type == TINYMCP_J_NONE)
         return 0;
-    if (obj.type != TINYMCP_J_OBJECT)
+    if (obj->type != TINYMCP_J_OBJECT)
         return -1;
     while (args->n < TINYMCP_ARGS_MAX &&
-           (rc = tinymcp_json_next(&obj, &pos, &k, &v)) == 1) {
+           (rc = tinymcp_json_next(obj, &pos, &k, &v)) == 1) {
         keys[args->n] = k;
         vals[args->n] = v;
         args->n++;
@@ -738,6 +845,40 @@ static int collect_args(req_t *r, tinymcp_args_t *args)
     return 0;
 }
 
+/* A located string decoded in place; NULL when v is not a string. */
+static char *decoded(const tinymcp_jv_t *v)
+{
+    char *s = (char *)v->at;
+
+    if (v->type != TINYMCP_J_STRING || tinymcp_json_decode(s, v->len) < 0)
+        return NULL;
+    return s;
+}
+
+/*
+ * The name and arguments params, both located before either is decoded:
+ * decoding shrinks a string in place, so params is not scanned after it.
+ */
+static int name_and_args(req_t *r, const char **name, tinymcp_args_t *args)
+{
+    tinymcp_jv_t n, a;
+
+    if (!param(r, "name", &n))
+        n.type = TINYMCP_J_NONE;
+    if (!param(r, "arguments", &a))
+        a.type = TINYMCP_J_NONE;
+    if (collect_object(&a, args) < 0) {
+        error_reply(r, -32602, "arguments must be an object of strings and numbers");
+        return -1;
+    }
+    *name = decoded(&n);
+    if (!*name) {
+        error_reply(r, -32602, "name missing");
+        return -1;
+    }
+    return 0;
+}
+
 static void do_tools_call(req_t *r)
 {
     tinymcp_jw_t *w = &r->w;
@@ -748,16 +889,8 @@ static void do_tools_call(req_t *r)
     unsigned i;
     int rc, found = 0;
 
-    /* The arguments are decoded before the name: both sit in params. */
-    if (collect_args(r, &args) < 0) {
-        error_reply(r, -32602, "arguments must be an object of strings and numbers");
+    if (name_and_args(r, &name, &args) < 0)
         return;
-    }
-    name = param_str(r, "name");
-    if (!name) {
-        error_reply(r, -32602, "name missing");
-        return;
-    }
     for (i = 0; i < h->ntools; i++)
         if (!strcmp(h->tools[i].name, name))
             found = 1;
@@ -779,6 +912,125 @@ static void do_tools_call(req_t *r)
         tinymcp_jw_key(w, "isError");
         tinymcp_jw_raw(w, "true");
     }
+    end_result(r);
+}
+
+static void do_prompts_get(req_t *r)
+{
+    tinymcp_jw_t *w = &r->w;
+    tinymcp_args_t args;
+    tinymcp_sink_t sink;
+    const char *name;
+    int rc;
+
+    if (name_and_args(r, &name, &args) < 0)
+        return;
+    begin_result(r);
+    tinymcp_jw_key(w, "messages");
+    tinymcp_jw_raw(w, "[{\"role\":\"user\",\"content\":{\"type\":\"text\","
+                      "\"text\":\"");
+    tinymcp_sink_init(&sink, w, r->t->out_cap - TAIL_RESERVE);
+    rc = r->t->host->prompt_get(r->t->ctx, name, &args, &sink);
+    if (rc == TINYMCP_ENOENT) {
+        error_reply(r, -32602, "unknown prompt");
+        return;
+    }
+    if (rc == TINYMCP_EINVAL) {
+        error_reply(r, -32602, "a required argument is missing");
+        return;
+    }
+    if (host_failed(r, rc, "the host could not render the prompt"))
+        return;
+    if (sink.cut)
+        tinymcp_jw_raw(w, "\\n[cut]");
+    tinymcp_jw_raw(w, "\"}}]");
+    end_result(r);
+}
+
+int tinymcp_complete_add(tinymcp_completion_t *c, const char *value)
+{
+    tinymcp_jw_t *w = c->w;
+    size_t mark = w->len;
+
+    c->offered++;
+    if (c->count >= TINYMCP_COMPLETE_MAX)
+        return TINYMCP_EFULL;
+    tinymcp_jw_sep(w);
+    tinymcp_jw_str(w, value);
+    if (w->full || w->len > c->limit) {
+        tinymcp_jw_reset(w, mark);
+        return TINYMCP_EFULL;
+    }
+    c->count++;
+    return 0;
+}
+
+static void do_complete(req_t *r)
+{
+    tinymcp_jw_t *w = &r->w;
+    tinymcp_jv_t ref, kind, target, arg, an, av, ctx, ctx_args;
+    tinymcp_args_t context;
+    tinymcp_completion_t c;
+    const char *ref_name, *arg_name, *value;
+    int is_prompt, rc;
+
+    if (!param(r, "ref", &ref) || ref.type != TINYMCP_J_OBJECT ||
+        tinymcp_json_get(&ref, "type", &kind) != 1) {
+        error_reply(r, -32602, "ref missing");
+        return;
+    }
+    if (tinymcp_json_is(&kind, "ref/prompt")) {
+        is_prompt = 1;
+    } else if (tinymcp_json_is(&kind, "ref/resource")) {
+        is_prompt = 0;
+    } else {
+        error_reply(r, -32602, "ref.type must be ref/prompt or ref/resource");
+        return;
+    }
+    if (tinymcp_json_get(&ref, is_prompt ? "name" : "uri", &target) != 1 ||
+        !param(r, "argument", &arg) || arg.type != TINYMCP_J_OBJECT ||
+        tinymcp_json_get(&arg, "name", &an) != 1 ||
+        tinymcp_json_get(&arg, "value", &av) != 1) {
+        error_reply(r, -32602, "ref or argument incomplete");
+        return;
+    }
+    ctx_args.type = TINYMCP_J_NONE;
+    if (param(r, "context", &ctx) && ctx.type == TINYMCP_J_OBJECT &&
+        tinymcp_json_get(&ctx, "arguments", &ctx_args) != 1)
+        ctx_args.type = TINYMCP_J_NONE;
+    /* Every value is located; now each is decoded where it lies. */
+    if (collect_object(&ctx_args, &context) < 0) {
+        error_reply(r, -32602, "context.arguments must be an object of strings");
+        return;
+    }
+    ref_name = decoded(&target);
+    arg_name = decoded(&an);
+    value = decoded(&av);
+    if (!ref_name || !arg_name || !value) {
+        error_reply(r, -32602, "ref and argument take strings");
+        return;
+    }
+    begin_result(r);
+    tinymcp_jw_key(w, "completion");
+    tinymcp_jw_raw(w, "{\"values\":[");
+    c.w = w;
+    c.limit = r->t->out_cap - TAIL_RESERVE;
+    c.count = 0;
+    c.offered = 0;
+    rc = r->t->host->complete(r->t->ctx, is_prompt, ref_name, arg_name, value,
+                              &context, &c);
+    if (rc == TINYMCP_ENOENT) {
+        error_reply(r, -32602, is_prompt ? "unknown prompt" : "unknown template");
+        return;
+    }
+    if (host_failed(r, rc, "the host could not complete"))
+        return;
+    tinymcp_jw_raw(w, "]");
+    tinymcp_jw_key(w, "total");
+    tinymcp_jw_ulong(w, c.offered);
+    tinymcp_jw_key(w, "hasMore");
+    tinymcp_jw_raw(w, c.offered > c.count ? "true" : "false");
+    tinymcp_jw_raw(w, "}");
     end_result(r);
 }
 
@@ -806,7 +1058,7 @@ static void do_listen(req_t *r)
     tinymcp_jw_t *w = &r->w;
     tinymcp_jv_t filter, v, item;
     char id[TINYMCP_ID_MAX];
-    unsigned want_lc = 0, nuris = 0, needed, first = 0, i;
+    unsigned want_lc = 0, nuris = 0, needed, first = 0, i;  /* want_lc: LC_* */
     int have_first = 0, taken;
     size_t pos = 0;
 
@@ -821,7 +1073,10 @@ static void do_listen(req_t *r)
     }
     if (tinymcp_json_get(&filter, "resourcesListChanged", &v) == 1 &&
         v.type == TINYMCP_J_TRUE)
-        want_lc = 1;
+        want_lc |= TINYMCP_LC_RESOURCES;
+    if (tinymcp_json_get(&filter, "promptsListChanged", &v) == 1 &&
+        v.type == TINYMCP_J_TRUE && t->host->prompt_list)
+        want_lc |= TINYMCP_LC_PROMPTS;
     if (tinymcp_json_get(&filter, "resourceSubscriptions", &v) == 1 &&
         v.type == TINYMCP_J_ARRAY && t->host->watch) {
         while (tinymcp_json_item(&v, &pos, &item) == 1)
@@ -871,7 +1126,7 @@ static void do_listen(req_t *r)
             }
         }
         if (have_first)
-            t->subs[first].listchanged = 1;
+            t->subs[first].listchanged = (unsigned char)want_lc;
     }
     /* The acknowledgment is the first message on the stream. */
     tinymcp_jw_reset(w, 0);
@@ -880,8 +1135,12 @@ static void do_listen(req_t *r)
                       "\"params\":{\"_meta\":{\"" META_SUB "\":");
     tinymcp_jw_raw(w, id);
     tinymcp_jw_raw(w, "},\"notifications\":{");
-    if (want_lc) {
+    if (want_lc & TINYMCP_LC_RESOURCES) {
         tinymcp_jw_key(w, "resourcesListChanged");
+        tinymcp_jw_raw(w, "true");
+    }
+    if (want_lc & TINYMCP_LC_PROMPTS) {
+        tinymcp_jw_key(w, "promptsListChanged");
         tinymcp_jw_raw(w, "true");
     }
     if (nuris) {
@@ -1023,6 +1282,12 @@ static void dispatch(req_t *r)
         do_templates_list(r);
     else if (!strcmp(m, "resources/read"))
         do_resources_read(r);
+    else if (!strcmp(m, "prompts/list") && r->t->host->prompt_list)
+        do_prompts_list(r);
+    else if (!strcmp(m, "prompts/get") && r->t->host->prompt_get)
+        do_prompts_get(r);
+    else if (!strcmp(m, "completion/complete") && r->t->host->complete)
+        do_complete(r);
     else if (!strcmp(m, "subscriptions/listen") && r->modern)
         do_listen(r);
     else if (!strcmp(m, "resources/subscribe") && !r->modern &&
@@ -1230,10 +1495,19 @@ void tinymcp_updated(tinymcp_t *t, unsigned slot)
 void tinymcp_listchanged(tinymcp_t *t)
 {
     if (t->busy) {
-        t->pending_lc = 1;
+        t->pending_lc |= TINYMCP_LC_RESOURCES;
         return;
     }
-    notify_listchanged(t);
+    notify_listchanged(t, TINYMCP_LC_RESOURCES);
+}
+
+void tinymcp_prompts_changed(tinymcp_t *t)
+{
+    if (t->busy) {
+        t->pending_lc |= TINYMCP_LC_PROMPTS;
+        return;
+    }
+    notify_listchanged(t, TINYMCP_LC_PROMPTS);
 }
 
 void tinymcp_closed(tinymcp_t *t)
@@ -1297,4 +1571,87 @@ int tinymcp_arg_bool(const tinymcp_args_t *args, const char *key, int dflt)
         }
     }
     return dflt;
+}
+
+/* Templates */
+
+static int name_char(char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_';
+}
+
+/* The length of the name when s opens a {{name}} placeholder, else 0. */
+static size_t placeholder(const char *s, size_t n)
+{
+    size_t i;
+
+    if (n < 5 || s[0] != '{' || s[1] != '{')
+        return 0;
+    for (i = 2; i < n && i - 2 < TINYMCP_PNAME_MAX - 1 && name_char(s[i]); i++)
+        ;
+    if (i == 2 || i + 1 >= n || s[i] != '}' || s[i + 1] != '}')
+        return 0;
+    return i - 2;
+}
+
+/* The string argument named by name[0..n), or NULL. */
+static const char *arg_strn(const tinymcp_args_t *args, const char *name,
+                            size_t n)
+{
+    unsigned i;
+
+    for (i = 0; i < args->n; i++)
+        if (strlen(args->a[i].key) == n && !memcmp(args->a[i].key, name, n))
+            return args->a[i].str;
+    return NULL;
+}
+
+unsigned tinymcp_placeholders(const char *text, size_t len,
+                              char names[][TINYMCP_PNAME_MAX], unsigned max)
+{
+    unsigned count = 0, j;
+    size_t i, k;
+
+    for (i = 0; i < len; i++) {
+        k = placeholder(text + i, len - i);
+        if (!k)
+            continue;
+        for (j = 0; j < count; j++)
+            if (strlen(names[j]) == k && !memcmp(names[j], text + i + 2, k))
+                break;
+        if (j == count && count < max) {
+            memcpy(names[count], text + i + 2, k);
+            names[count][k] = 0;
+            count++;
+        }
+        i += k + 3;
+    }
+    return count;
+}
+
+int tinymcp_render(tinymcp_sink_t *sink, const char *text, size_t len,
+                   const tinymcp_args_t *args)
+{
+    size_t i, k;
+    const char *v;
+
+    for (i = 0; i < len; i++) {
+        k = placeholder(text + i, len - i);
+        if (k && !arg_strn(args, text + i + 2, k))
+            return TINYMCP_EINVAL;
+        if (k)
+            i += k + 3;
+    }
+    for (i = 0; i < len; i++) {
+        k = placeholder(text + i, len - i);
+        if (!k) {
+            tinymcp_sink_putc(sink, text[i]);
+            continue;
+        }
+        v = arg_strn(args, text + i + 2, k);
+        tinymcp_sink_puts(sink, v);
+        i += k + 3;
+    }
+    return 0;
 }

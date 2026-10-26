@@ -10,7 +10,7 @@ what the binding maps, so another host can take the same shape.
 
 | Entry | tikuOS |
 |---|---|
-| `name`, `version` | `tinymcp`, `TINYMCP_VERSION` |
+| `name`, `title`, `version` | `/sys/device/name` read before each request, "tikuOS on <device>", `TIKU_VERSION` |
 | `instructions` | the board's identity: port, board, what the namespace is |
 | `tools` | `read`, `write`, `ls` over the VFS; `shell` and `basic` where the shell is built |
 | `templates` | `tiku:///{+path}` and `tiku:///{+path}{?line,bytes}` |
@@ -18,6 +18,8 @@ what the binding maps, so another host can take the same shape.
 | `resource_read` | `tiku_vfs_read_policy`, so a node whose read acts is `TINYMCP_EEFFECT` |
 | `tool_call` | the VFS for `read`/`write`/`ls`; the shell parser with its output captured through `tinymcp_sink_putc` for `shell`; the BASIC mode API for `basic` |
 | `watch`, `unwatch` | `tiku_vfs_watch` into the tinymcp process; `TIKU_EVENT_VFS` becomes `tinymcp_updated(slot)` |
+| `prompt_list`, `prompt_get` | `/data/prompt.<name>` files: the first line describes, `{{argument}}` places are the arguments, `tinymcp_render` fills them |
+| `complete` | a `path` argument against the namespace, through `tiku_vfs_list` |
 | `send` | one console frame on channel `0xF3`, or `tcp_send` from the pump |
 
 ## Streams

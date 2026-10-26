@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# tinymcp v0.1
+# tinymcp v0.2
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
@@ -60,6 +60,24 @@ mutate surrogate-pair tinymcp_json.c 's/cp = 0x10000 + ((cp - 0xD800) << 10) + (
 mutate separator tinymcp_json.c "s/if (c == '{' || c == '\\[' || c == ':')/if (0)/"
 mutate writer-off-by-one tinymcp_json.c 's/if (w->len + n >= w->cap) {/if (w->len + n > w->cap) {/'
 mutate sink-limit tinymcp_json.c 's/if (s->w->len + k > s->limit || s->w->len + k >= s->w->cap) {/if (s->w->len + k >= s->w->cap) {/'
+
+mutate no-title tinymcp.c 's/    if (h->title) {/    if (0) {/'
+mutate no-library-meta tinymcp.c 's/        if (library)$/        if (0)/'
+mutate no-prompts-cap tinymcp.c 's/    if (h->prompt_list) {/    if (0) {/'
+mutate no-completions-cap tinymcp.c 's/    if (h->complete) {/    if (0) {/'
+mutate required-always tinymcp.c 's/args\[i\].required ? "true" : "false"/"true"/'
+mutate prompt-einval tinymcp.c 's/    if (rc == TINYMCP_EINVAL) {/    if (0) {/'
+mutate name-rescanned tinymcp.c 's/    \*name = decoded(&n);/    *name = param_str(r, "name");/'
+mutate complete-uncapped tinymcp.c 's/    if (c->count >= TINYMCP_COMPLETE_MAX)/    if (0)/'
+mutate has-more tinymcp.c 's/c.offered > c.count ? "true"/c.offered >= c.count ? "true"/'
+mutate no-context tinymcp.c 's/tinymcp_json_get(&ctx, "arguments", &ctx_args) != 1)/1)/'
+mutate prompts-filter tinymcp.c 's/        want_lc |= TINYMCP_LC_PROMPTS;/        want_lc |= TINYMCP_LC_RESOURCES;/'
+mutate prompts-method tinymcp.c 's/? "notifications\/prompts\/list_changed"/? "notifications\/resources\/list_changed"/'
+mutate prompts-pending tinymcp.c 's/        t->pending_lc |= TINYMCP_LC_PROMPTS;/        t->pending_lc |= 0;/'
+
+mutate render-unchecked tinymcp.c 's/        if (k \&\& !arg_strn(args, text + i + 2, k))/        if (0)/'
+mutate placeholder-long tinymcp.c 's/i - 2 < TINYMCP_PNAME_MAX - 1 \&\&/i - 2 < TINYMCP_PNAME_MAX \&\&/'
+mutate placeholder-dup tinymcp.c 's/        if (j == count \&\& count < max) {/        if (count < max) {/'
 
 echo "$total mutants, $survived survived"
 [ "$survived" -eq 0 ]

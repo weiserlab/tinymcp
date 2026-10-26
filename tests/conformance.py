@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# tinymcp v0.1
+# tinymcp v0.2
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
@@ -9,7 +9,7 @@
 # conformance.py - the official mcp SDK client against the POSIX example in
 # every era it can speak: pinned 2026-07-28, auto-negotiated, and the
 # initialize handshake.  Each run lists, calls, reads, subscribes and sees a
-# change arrive.
+# change arrive, gets a prompt and completes a name.
 #
 # SPDX-License-Identifier: Apache-2.0
 
@@ -22,7 +22,8 @@ import anyio
 import mcp_types as types
 from mcp import Client, MCPError
 from mcp.client.stdio import StdioServerParameters
-from mcp.shared.subscriptions import ResourcesListChanged, ResourceUpdated
+from mcp.shared.subscriptions import (PromptsListChanged, ResourcesListChanged,
+                                      ResourceUpdated)
 
 failures = 0
 checks = 0
@@ -45,8 +46,10 @@ async def common(c, mode, dirpath):
     if mode == "legacy" or mode == "auto":
         expect(c.server_info is not None and c.server_info.name == "tinymcp-posix",
                f"serverInfo name: {c.server_info}")
-        expect(c.server_info is not None and c.server_info.version == "0.1.0",
+        expect(c.server_info is not None and c.server_info.version == "0.2.0",
                "serverInfo version")
+        expect(c.server_info is not None and c.server_info.title == "tinymcp on POSIX",
+               f"serverInfo title: {c.server_info}")
         instructions = c.instructions
         caps = c.server_capabilities
     else:
@@ -61,6 +64,9 @@ async def common(c, mode, dirpath):
     expect(caps.tools is not None, "tools capability")
     expect(caps.resources is not None and caps.resources.subscribe is True
            and caps.resources.list_changed is True, f"resources capability: {caps.resources}")
+    expect(caps.prompts is not None and caps.prompts.list_changed is True,
+           f"prompts capability: {caps.prompts}")
+    expect(caps.completions is not None, "completions capability")
 
     tools = await c.list_tools()
     names = sorted(t.name for t in tools.tools)
@@ -117,9 +123,45 @@ async def common(c, mode, dirpath):
     except MCPError as e:
         expect(e.error.code in (-32002, -32602), "path outside the directory refused")
 
+    await prompts_and_completion(c)
+
     if legacy:
         await c.send_ping()
         expect(True, "ping answered")
+
+
+async def prompts_and_completion(c):
+    p = await c.list_prompts()
+    expect([x.name for x in p.prompts] == ["greet"], f"prompt names {p.prompts}")
+    greet = p.prompts[0]
+    expect(greet.description == "Greet a person", f"prompt description {greet.description!r}")
+    expect([(a.name, a.required) for a in greet.arguments or []] ==
+           [("who", True), ("lang", True)], f"prompt arguments {greet.arguments}")
+    r = await c.get_prompt("greet", {"who": 'Ada "L"', "lang": "C"})
+    expect(len(r.messages) == 1 and r.messages[0].role == "user", "one user message")
+    expect(r.messages[0].content.text == 'Greet a person\nSay hello to Ada "L" in C.\n',
+           f"prompt text {r.messages[0].content.text!r}")
+    for name, args in (("greet", {"who": "Ada"}), ("nobody", {})):
+        try:
+            await c.get_prompt(name, args)
+            expect(False, f"prompts/get {name} {args} accepted")
+        except MCPError as e:
+            expect(e.error.code == -32602, f"prompts/get {name} code {e.error.code}")
+
+    ref = types.ResourceTemplateReference(uri="file:///{name}")
+    r = await c.complete(ref, {"name": "name", "value": "a"})
+    expect(r.completion.values == ["a.txt"] and r.completion.has_more is False,
+           f"completion of a {r.completion}")
+    r = await c.complete(ref, {"name": "name", "value": ""})
+    expect(r.completion.values == ["a.txt", "b.txt"] and r.completion.total == 2,
+           f"completion of nothing {r.completion}")
+    r = await c.complete(types.PromptReference(name="greet"), {"name": "who", "value": ""})
+    expect(r.completion.values == [], f"completion of who {r.completion}")
+    try:
+        await c.complete(types.PromptReference(name="nobody"), {"name": "who", "value": ""})
+        expect(False, "completion of an unknown prompt accepted")
+    except MCPError as e:
+        expect(e.error.code == -32602, f"unknown prompt completion code {e.error.code}")
 
 
 async def modern_subscriptions(c, dirpath):
@@ -140,6 +182,14 @@ async def modern_subscriptions(c, dirpath):
         expect(isinstance(ev, ResourcesListChanged), f"list changed event {ev}")
         r = await c.read_resource("file:///a.txt")
         expect(r.contents[0].text == "changed\n", "the change is readable")
+    async with c.listen(prompts_list_changed=True) as sub:
+        expect(sub.honored.prompts_list_changed is True, "prompt list changes honoured")
+        r = await c.call_tool("write", {"name": "prompt.bye", "text": "Say bye\n"})
+        with anyio.fail_after(5):
+            ev = await sub.__anext__()
+        expect(isinstance(ev, PromptsListChanged), f"prompts changed event {ev}")
+        p = await c.list_prompts()
+        expect([x.name for x in p.prompts] == ["bye", "greet"], f"prompts after {p.prompts}")
     # After the stream is closed, a change raises nothing on the client.
     r = await c.call_tool("write", {"name": "a.txt", "text": "again\n"})
     expect(not r.is_error, "write after the listen ended")
@@ -153,6 +203,9 @@ async def legacy_subscriptions(c, seen):
     r = await c.call_tool("write", {"name": "c.txt", "text": "new\n"})
     await anyio.sleep(0.2)
     expect(("list_changed", None) in seen, f"legacy list_changed notification {seen}")
+    r = await c.call_tool("write", {"name": "prompt.bye", "text": "Say bye\n"})
+    await anyio.sleep(0.2)
+    expect(("prompts_changed", None) in seen, f"legacy prompts list_changed {seen}")
     await c.unsubscribe_resource("file:///a.txt")
     seen.clear()
     r = await c.call_tool("write", {"name": "a.txt", "text": "silent\n"})
@@ -172,6 +225,8 @@ async def run(mode, exe):
             f.write("one\ntwo\nthree\n")
         with open(os.path.join(dirpath, "b.txt"), "w") as f:
             f.write("bravo")
+        with open(os.path.join(dirpath, "prompt.greet"), "w") as f:
+            f.write("Greet a person\nSay hello to {{who}} in {{lang}}.\n")
         seen = []
 
         async def handler(msg):
@@ -179,6 +234,8 @@ async def run(mode, exe):
                 seen.append(("updated", msg.params.uri))
             elif isinstance(msg, types.ResourceListChangedNotification):
                 seen.append(("list_changed", None))
+            elif isinstance(msg, types.PromptListChangedNotification):
+                seen.append(("prompts_changed", None))
             elif isinstance(msg, Exception):
                 seen.append(("error", repr(msg)))
 

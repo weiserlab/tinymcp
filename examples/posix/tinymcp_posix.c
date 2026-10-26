@@ -1,13 +1,14 @@
 /*
- * tinymcp v0.1
+ * tinymcp v0.2
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
  * Authors: Ambuj Varshney <ambuj@tiku-os.org>
  *
  * tinymcp_posix.c - an MCP server over stdin and stdout that serves the
- * files of one directory as resources and runs lines through the shell: the
- * conformance target, and the shape a binding takes on any host.
+ * files of one directory as resources, its prompt.<name> files as prompts,
+ * completes file names, and runs lines through the shell: the conformance
+ * target, and the shape a binding takes on any host.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -33,6 +34,14 @@ static int trace;
 static char watched[TINYMCP_SUBS_MAX][NAME_MAX_LEN];
 
 static const char *const uri_prefix = "file:///";
+static const char *const prompt_prefix = "prompt.";
+#define PROMPT_MAX 8192   /* the longest prompt file served */
+
+static int is_prompt_file(const char *name)
+{
+    return !strncmp(name, prompt_prefix, strlen(prompt_prefix)) &&
+           name[strlen(prompt_prefix)];
+}
 
 /* The file name a URI names, or NULL when it is not one of this directory. */
 static const char *uri_name(const char *uri)
@@ -60,19 +69,17 @@ static int cmp_names(const void *a, const void *b)
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
-/* The directory's regular files, sorted, as resources from cursor on. */
-static int list(void *ctx, unsigned cursor, tinymcp_list_t *out)
+/* The directory's regular files, sorted: the prompt files when prompts is
+ * set, the others when not.  The caller frees each name. */
+static unsigned files(char *names[], unsigned max, int prompts)
 {
     DIR *d = opendir(dir);
     struct dirent *e;
-    char *names[256];
-    unsigned n = 0, i;
-    int next = 0;
+    unsigned n = 0;
 
-    (void)ctx;
     if (!d)
-        return TINYMCP_EIO;
-    while ((e = readdir(d)) != NULL && n < 256) {
+        return 0;
+    while ((e = readdir(d)) != NULL && n < max) {
         char path[512];
         struct stat st;
 
@@ -80,10 +87,24 @@ static int list(void *ctx, unsigned cursor, tinymcp_list_t *out)
             continue;
         if (stat(path, &st) || !S_ISREG(st.st_mode))
             continue;
+        if (is_prompt_file(e->d_name) != prompts)
+            continue;
         names[n++] = strdup(e->d_name);
     }
     closedir(d);
     qsort(names, n, sizeof names[0], cmp_names);
+    return n;
+}
+
+/* The directory's files but the prompts, as resources from cursor on. */
+static int list(void *ctx, unsigned cursor, tinymcp_list_t *out)
+{
+    char *names[256];
+    unsigned n, i;
+    int next = 0;
+
+    (void)ctx;
+    n = files(names, 256, 0);
     for (i = cursor; i < n && !next; i++) {
         char uri[NAME_MAX_LEN + 16];
 
@@ -145,6 +166,106 @@ static const tinymcp_template_t templates[] = {
       "from line, at most bytes" },
 };
 
+/* A prompt file's text, NUL-terminated, into buf; its length, or -1. */
+static long prompt_text(const char *pname, char *buf, size_t cap)
+{
+    char fname[NAME_MAX_LEN + 8], path[512];
+    FILE *f;
+    size_t n;
+
+    if (strchr(pname, '/') ||
+        snprintf(fname, sizeof fname, "%s%s", prompt_prefix, pname) >=
+            (int)sizeof fname ||
+        path_of(fname, path, sizeof path))
+        return -1;
+    f = fopen(path, "r");
+    if (!f)
+        return -1;
+    n = fread(buf, 1, cap - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    return (long)n;
+}
+
+/* The prompts, prompt.<name> files: the first line describes each, and its
+ * {{placeholders}} are its required arguments. */
+static int prompt_list(void *ctx, unsigned cursor, tinymcp_list_t *out)
+{
+    static char text[PROMPT_MAX];
+    char *names[256], desc[256];
+    char ph[TINYMCP_ARGS_MAX][TINYMCP_PNAME_MAX];
+    tinymcp_prompt_arg_t args[TINYMCP_ARGS_MAX];
+    unsigned n, i, j, nargs;
+    int next = 0;
+    long len;
+
+    (void)ctx;
+    n = files(names, 256, 1);
+    for (i = cursor; i < n && !next; i++) {
+        const char *pname = names[i] + strlen(prompt_prefix);
+
+        len = prompt_text(pname, text, sizeof text);
+        if (len < 0)
+            continue;
+        snprintf(desc, sizeof desc, "%.*s", (int)strcspn(text, "\n"), text);
+        nargs = tinymcp_placeholders(text, (size_t)len, ph, TINYMCP_ARGS_MAX);
+        for (j = 0; j < nargs; j++) {
+            args[j].name = ph[j];
+            args[j].description = NULL;
+            args[j].required = 1;
+        }
+        if (tinymcp_prompt_add(out, pname, desc[0] ? desc : NULL, args,
+                               nargs) != 0)
+            next = i ? (int)i : TINYMCP_EFULL;
+    }
+    for (i = 0; i < n; i++)
+        free(names[i]);
+    return next;
+}
+
+static int prompt_get(void *ctx, const char *pname, const tinymcp_args_t *args,
+                      tinymcp_sink_t *text)
+{
+    static char body[PROMPT_MAX];
+    long len;
+
+    (void)ctx;
+    len = prompt_text(pname, body, sizeof body);
+    if (len < 0)
+        return TINYMCP_ENOENT;
+    return tinymcp_render(text, body, (size_t)len, args);
+}
+
+/* File names for the templates' name and a prompt argument called name. */
+static int complete(void *ctx, int is_prompt, const char *ref, const char *arg,
+                    const char *value, const tinymcp_args_t *context,
+                    tinymcp_completion_t *c)
+{
+    char *names[256];
+    unsigned n, i;
+
+    (void)ctx;
+    (void)context;
+    if (is_prompt) {
+        char probe[8];
+
+        if (prompt_text(ref, probe, sizeof probe) < 0)
+            return TINYMCP_ENOENT;
+    } else if (strcmp(ref, "file:///{name}") &&
+               strcmp(ref, "file:///{name}{?line,bytes}")) {
+        return TINYMCP_ENOENT;
+    }
+    if (strcmp(arg, "name"))
+        return TINYMCP_OK;
+    n = files(names, 256, 0);
+    for (i = 0; i < n; i++) {
+        if (!strncmp(names[i], value, strlen(value)))
+            tinymcp_complete_add(c, names[i]);
+        free(names[i]);
+    }
+    return TINYMCP_OK;
+}
+
 static int call(void *ctx, const char *name, const tinymcp_args_t *args,
                 tinymcp_sink_t *text)
 {
@@ -201,7 +322,9 @@ static int call(void *ctx, const char *name, const tinymcp_args_t *args,
         for (i = 0; i < TINYMCP_SUBS_MAX; i++)
             if (!strcmp(watched[i], fname))
                 tinymcp_updated(&server, i);
-        if (!existed)
+        if (is_prompt_file(fname))
+            tinymcp_prompts_changed(&server);
+        else if (!existed)
             tinymcp_listchanged(&server);
         return TINYMCP_OK;
     }
@@ -244,7 +367,8 @@ static const tinymcp_host_t host = {
     "where the server runs.",
     tools, sizeof tools / sizeof tools[0],
     templates, sizeof templates / sizeof templates[0],
-    list, read_file, call, watch, unwatch, send_line
+    list, read_file, call, watch, unwatch, send_line,
+    "tinymcp on POSIX", prompt_list, prompt_get, complete
 };
 
 int main(int argc, char **argv)

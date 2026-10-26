@@ -1,5 +1,5 @@
 /*
- * tinymcp v0.1
+ * tinymcp v0.2
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
@@ -7,7 +7,7 @@
  *
  * test_tinymcp.c - the protocol against a fake host: both eras, every
  * method, every error code, the buffers' edges, subscriptions and their
- * eviction.  Each check is known to fail on a mutant (tests/mutants.sh).
+ * eviction, prompts and completion.  Each check is known to fail on a mutant (tests/mutants.sh).
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -106,6 +106,7 @@ static const tinymcp_tool_t tools[] = {
     { "long", "more than fits", "{\"type\":\"object\"}" },
     { "touch", "notifies slot 0 from inside the call", "{\"type\":\"object\"}" },
     { "flag", "a boolean", "{\"type\":\"object\"}" },
+    { "reprompt", "prompts changed, from inside the call", "{\"type\":\"object\"}" },
 };
 #define NTOOLS (sizeof tools / sizeof tools[0])
 
@@ -153,6 +154,11 @@ static int fake_tool(void *ctx, const char *name, const tinymcp_args_t *args,
         tinymcp_sink_puts(text, "touched");
         return TINYMCP_OK;
     }
+    if (!strcmp(name, "reprompt")) {
+        tinymcp_prompts_changed(touch_target);
+        tinymcp_sink_puts(text, "reprompted");
+        return TINYMCP_OK;
+    }
     if (!strcmp(name, "flag")) {
         tinymcp_sink_puts(text, tinymcp_arg_bool(args, "on", 0) ? "on" : "off");
         return TINYMCP_OK;
@@ -177,16 +183,122 @@ static void fake_unwatch(void *ctx, unsigned slot)
     watched[slot][0] = 0;
 }
 
+/* Prompts: greet takes who (required) and mood; plain takes nothing. */
+static const tinymcp_prompt_arg_t greet_args[] = {
+    { "who", "whom to greet", 1 },
+    { "mood", NULL, 0 },
+};
+
+static const char *const prompt_names[] = { "greet", "plain", "huge" };
+#define NPROMPTS (sizeof prompt_names / sizeof prompt_names[0])
+
+static int fake_prompt_list(void *ctx, unsigned cursor, tinymcp_list_t *list)
+{
+    unsigned i;
+
+    (void)ctx;
+    for (i = cursor; i < NPROMPTS; i++) {
+        int rc = i == 0 ? tinymcp_prompt_add(list, "greet", "a greeting",
+                                             greet_args, 2)
+                        : tinymcp_prompt_add(list, prompt_names[i], NULL,
+                                             NULL, 0);
+
+        if (rc != 0)
+            return i ? (int)i : TINYMCP_EFULL;
+    }
+    return 0;
+}
+
+static int fake_prompt_get(void *ctx, const char *name,
+                           const tinymcp_args_t *args, tinymcp_sink_t *text)
+{
+    (void)ctx;
+    if (!strcmp(name, "greet")) {
+        const char *who = tinymcp_arg_str(args, "who");
+        const char *mood = tinymcp_arg_str(args, "mood");
+
+        if (!who)
+            return TINYMCP_EINVAL;
+        tinymcp_sink_puts(text, "Hello, ");
+        tinymcp_sink_puts(text, who);
+        if (mood) {
+            tinymcp_sink_puts(text, " (");
+            tinymcp_sink_puts(text, mood);
+            tinymcp_sink_puts(text, ")");
+        }
+        return 0;
+    }
+    if (!strcmp(name, "plain")) {
+        tinymcp_sink_puts(text, "Just text.\nTwo lines.");
+        return 0;
+    }
+    if (!strcmp(name, "huge")) {
+        int i;
+
+        for (i = 0; i < 20000; i++)
+            tinymcp_sink_putc(text, 'z');
+        return 0;
+    }
+    return TINYMCP_ENOENT;
+}
+
+static const char *const people[] = { "ada", "alan", "grace" };
+
+/* who of greet from people; path of test:///{+path} from p000..p149, or the
+ * context's dir argument when it is set. */
+static int fake_complete(void *ctx, int is_prompt, const char *ref,
+                         const char *arg, const char *value,
+                         const tinymcp_args_t *context, tinymcp_completion_t *c)
+{
+    size_t n = strlen(value);
+    unsigned i;
+
+    (void)ctx;
+    if (is_prompt && !strcmp(ref, "greet")) {
+        if (strcmp(arg, "who"))
+            return 0;
+        for (i = 0; i < sizeof people / sizeof people[0]; i++)
+            if (!strncmp(people[i], value, n))
+                tinymcp_complete_add(c, people[i]);
+        return 0;
+    }
+    if (!is_prompt && !strcmp(ref, "test:///{+path}")) {
+        const char *dir = tinymcp_arg_str(context, "dir");
+        char v[8];
+
+        if (dir) {
+            tinymcp_complete_add(c, dir);
+            return 0;
+        }
+        for (i = 0; i < 150; i++) {
+            snprintf(v, sizeof v, "p%03u", i);
+            if (!strncmp(v, value, n))
+                tinymcp_complete_add(c, v);
+        }
+        return 0;
+    }
+    return TINYMCP_ENOENT;
+}
+
 static const tinymcp_host_t host = {
     "fake", "9.9", "Be nice to the fake.",
     tools, NTOOLS, templates, 2,
-    fake_list, fake_read, fake_tool, fake_watch, fake_unwatch, fake_send
+    fake_list, fake_read, fake_tool, fake_watch, fake_unwatch, fake_send,
+    NULL, NULL, NULL, NULL
+};
+
+static const tinymcp_host_t host_full = {
+    "fake", "9.9", "Be nice to the fake.",
+    tools, NTOOLS, templates, 2,
+    fake_list, fake_read, fake_tool, fake_watch, fake_unwatch, fake_send,
+    "The Fake", fake_prompt_list, fake_prompt_get, fake_complete
 };
 
 static const tinymcp_host_t host_plain = {
     "plain", "1", NULL,
     tools, 1, NULL, 0,
-    NULL, NULL, fake_tool, NULL, NULL, fake_send
+    NULL, NULL, fake_tool, NULL, NULL, fake_send,
+    NULL, NULL, NULL, NULL
 };
 
 /* The checks */
@@ -252,7 +364,8 @@ static void modern_discover(void)
               "\"params\":{" META "}}") == 1);
     CONTAINS(last(), "\"id\":1,\"result\":{\"resultType\":\"complete\"");
     CONTAINS(last(), "\"_meta\":{\"io.modelcontextprotocol/serverInfo\":"
-                     "{\"name\":\"fake\",\"version\":\"9.9\"}}");
+                     "{\"name\":\"fake\",\"version\":\"9.9\"},"
+                     "\"org.tinymcp/library\":\"tinymcp " TINYMCP_VERSION "\"}");
     CONTAINS(last(), "\"supportedVersions\":[\"2026-07-28\",\"2025-11-25\","
                      "\"2025-06-18\",\"2025-03-26\",\"2024-11-05\"]");
     CONTAINS(last(), "\"capabilities\":{\"tools\":{},\"resources\":"
@@ -649,7 +762,9 @@ static void legacy_session(void)
     say("{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{"
         "\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":"
         "{\"name\":\"c\",\"version\":\"1\"}}}");
-    SAME(last(), "{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":"
+    SAME(last(), "{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"_meta\":"
+                 "{\"org.tinymcp/library\":\"tinymcp " TINYMCP_VERSION "\"},"
+                 "\"protocolVersion\":"
                  "\"2025-06-18\",\"capabilities\":{\"tools\":{},\"resources\":"
                  "{\"subscribe\":true,\"listChanged\":true}},\"serverInfo\":"
                  "{\"name\":\"fake\",\"version\":\"9.9\"},\"instructions\":"
@@ -827,6 +942,300 @@ static void json_edges(void)
     }
 }
 
+static void modern_identity(void)
+{
+    reset(&host_full, sizeof out_buf, 4);
+    say("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\","
+        "\"params\":{" META "}}");
+    CONTAINS(last(), "\"io.modelcontextprotocol/serverInfo\":{\"name\":\"fake\","
+                     "\"title\":\"The Fake\",\"version\":\"9.9\"}");
+    CONTAINS(last(), "\"capabilities\":{\"tools\":{},\"resources\":"
+                     "{\"subscribe\":true,\"listChanged\":true},\"prompts\":"
+                     "{\"listChanged\":true},\"completions\":{}}");
+    /* Every reply carries the title; only discover carries the library. */
+    say("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\",\"params\":{" META "}}");
+    CONTAINS(last(), "\"title\":\"The Fake\"");
+    LACKS(last(), "org.tinymcp/library");
+
+    reset(&host_full, sizeof out_buf, 4);
+    say("{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{"
+        "\"protocolVersion\":\"2025-11-25\",\"capabilities\":{}}}");
+    CONTAINS(last(), "\"serverInfo\":{\"name\":\"fake\",\"title\":\"The Fake\","
+                     "\"version\":\"9.9\"}");
+    CONTAINS(last(), "\"prompts\":{\"listChanged\":true},\"completions\":{}}");
+}
+
+static void modern_prompts(void)
+{
+    reset(&host_full, sizeof out_buf, 4);
+    say("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"prompts/list\","
+        "\"params\":{" META "}}");
+    CONTAINS(last(), "\"prompts\":[{\"name\":\"greet\",\"description\":"
+                     "\"a greeting\",\"arguments\":[{\"name\":\"who\","
+                     "\"description\":\"whom to greet\",\"required\":true},"
+                     "{\"name\":\"mood\",\"required\":false}]},"
+                     "{\"name\":\"plain\"},{\"name\":\"huge\"}]");
+    LACKS(last(), "nextCursor");
+    CONTAINS(last(), "\"ttlMs\":0");
+
+    say("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"prompts/get\","
+        "\"params\":{\"name\":\"greet\",\"arguments\":{\"who\":\"ada\","
+        "\"mood\":\"glad\"}," META "}}");
+    CONTAINS(last(), "\"messages\":[{\"role\":\"user\",\"content\":"
+                     "{\"type\":\"text\",\"text\":\"Hello, ada (glad)\"}}]");
+    CONTAINS(last(), "\"resultType\":\"complete\"");
+
+    /* Arguments before the name, with an escaped quote: both still read. */
+    say("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"prompts/get\","
+        "\"params\":{\"arguments\":{\"who\":\"a\\\"b\"},\"name\":\"greet\","
+        META "}}");
+    CONTAINS(last(), "\"text\":\"Hello, a\\\"b\"");
+    /* A value ending in a backslash and a quote shifts what follows it
+     * once decoded; the name is found before that. */
+    say("{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\","
+        "\"params\":{\"arguments\":{\"text\":\"q\\\\\\\"\"},\"name\":\"echo\","
+        META "}}");
+    CONTAINS(last(), "\"text\":\"q\\\\\\\"\"}]");
+    say("{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"prompts/get\","
+        "\"params\":{\"arguments\":{\"who\":\"q\\\\\\\"\"},\"name\":\"greet\","
+        META "}}");
+    CONTAINS(last(), "\"text\":\"Hello, q\\\\\\\"\"}}]");
+
+    say("{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"prompts/get\","
+        "\"params\":{\"name\":\"greet\"," META "}}");
+    CONTAINS(last(), "\"id\":5,\"error\":{\"code\":-32602,\"message\":"
+                     "\"a required argument is missing\"}");
+    say("{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"prompts/get\","
+        "\"params\":{\"name\":\"nobody\"," META "}}");
+    CONTAINS(last(), "\"id\":6,\"error\":{\"code\":-32602,\"message\":"
+                     "\"unknown prompt\"}");
+    say("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"prompts/get\","
+        "\"params\":{" META "}}");
+    CONTAINS(last(), "\"id\":7,\"error\":{\"code\":-32602,\"message\":"
+                     "\"name missing\"}");
+    say("{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"prompts/get\","
+        "\"params\":{\"name\":\"plain\",\"arguments\":[]," META "}}");
+    CONTAINS(last(), "\"id\":8,\"error\":{\"code\":-32602");
+    say("{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"prompts/get\","
+        "\"params\":{\"name\":\"plain\"," META "}}");
+    CONTAINS(last(), "\"text\":\"Just text.\\nTwo lines.\"}}]");
+    say("{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"prompts/get\","
+        "\"params\":{\"name\":\"huge\"," META "}}");
+    CONTAINS(last(), "zz\\n[cut]\"}}]");
+    CHECK(strlen(last()) < sizeof out_buf);
+
+    /* Pages: a small reply holds one prompt at a time. */
+    reset(&host_full, 400, 4);
+    say("{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"prompts/list\","
+        "\"params\":{" META "}}");
+    CONTAINS(last(), "{\"name\":\"greet\"");
+    CONTAINS(last(), "\"nextCursor\":\"1\"");
+    say("{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"prompts/list\","
+        "\"params\":{\"cursor\":\"1\"," META "}}");
+    CONTAINS(last(), "[{\"name\":\"plain\"},{\"name\":\"huge\"}]");
+    LACKS(last(), "nextCursor");
+    reset(&host_full, 160, 4);
+    say("{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"prompts/list\","
+        "\"params\":{" META "}}");
+    CONTAINS(last(), "\"code\":-32603");
+
+    /* A host without prompts answers neither method. */
+    reset(&host_plain, sizeof out_buf, 4);
+    say("{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"prompts/list\","
+        "\"params\":{" META "}}");
+    CONTAINS(last(), "\"code\":-32601");
+    say("{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"prompts/get\","
+        "\"params\":{\"name\":\"greet\"," META "}}");
+    CONTAINS(last(), "\"code\":-32601");
+    say("{\"jsonrpc\":\"2.0\",\"id\":16,\"method\":\"completion/complete\","
+        "\"params\":{\"ref\":{\"type\":\"ref/prompt\",\"name\":\"greet\"},"
+        "\"argument\":{\"name\":\"who\",\"value\":\"\"}," META "}}");
+    CONTAINS(last(), "\"code\":-32601");
+}
+
+#define COMPLETE(id, ref, arg, extra) \
+    "{\"jsonrpc\":\"2.0\",\"id\":" id ",\"method\":\"completion/complete\"," \
+    "\"params\":{\"ref\":" ref ",\"argument\":" arg extra "," META "}}"
+
+static void modern_completion(void)
+{
+    reset(&host_full, sizeof out_buf, 4);
+    say(COMPLETE("1", "{\"type\":\"ref/prompt\",\"name\":\"greet\"}",
+                 "{\"name\":\"who\",\"value\":\"a\"}", ""));
+    CONTAINS(last(), "\"completion\":{\"values\":[\"ada\",\"alan\"],"
+                     "\"total\":2,\"hasMore\":false}");
+    CONTAINS(last(), "\"resultType\":\"complete\"");
+    /* The value's escapes are decoded before matching. */
+    say(COMPLETE("2", "{\"type\":\"ref/prompt\",\"name\":\"greet\"}",
+                 "{\"name\":\"who\",\"value\":\"a\\u0064\"}", ""));
+    CONTAINS(last(), "\"values\":[\"ada\"],\"total\":1,\"hasMore\":false}");
+    say(COMPLETE("3", "{\"type\":\"ref/prompt\",\"name\":\"greet\"}",
+                 "{\"name\":\"mood\",\"value\":\"\"}", ""));
+    CONTAINS(last(), "\"values\":[],\"total\":0,\"hasMore\":false}");
+
+    /* A hundred values at most; the total says how many there were. */
+    say(COMPLETE("4", "{\"type\":\"ref/resource\",\"uri\":\"test:///{+path}\"}",
+                 "{\"name\":\"path\",\"value\":\"p\"}", ""));
+    CONTAINS(last(), "\"p099\"],\"total\":150,\"hasMore\":true}");
+    LACKS(last(), "p100");
+    say(COMPLETE("5", "{\"type\":\"ref/resource\",\"uri\":\"test:///{+path}\"}",
+                 "{\"name\":\"path\",\"value\":\"p14\"}", ""));
+    CONTAINS(last(), "\"values\":[\"p140\",");
+    CONTAINS(last(), "\"p149\"],\"total\":10,\"hasMore\":false}");
+    /* The context's arguments reach the host. */
+    say(COMPLETE("6", "{\"type\":\"ref/resource\",\"uri\":\"test:///{+path}\"}",
+                 "{\"name\":\"path\",\"value\":\"\"}",
+                 ",\"context\":{\"arguments\":{\"dir\":\"d\\/x\"}}"));
+    CONTAINS(last(), "\"values\":[\"d/x\"],\"total\":1");
+
+    say(COMPLETE("7", "{\"type\":\"ref/prompt\",\"name\":\"nobody\"}",
+                 "{\"name\":\"who\",\"value\":\"\"}", ""));
+    CONTAINS(last(), "\"id\":7,\"error\":{\"code\":-32602,\"message\":"
+                     "\"unknown prompt\"}");
+    say(COMPLETE("8", "{\"type\":\"ref/resource\",\"uri\":\"test:///x\"}",
+                 "{\"name\":\"path\",\"value\":\"\"}", ""));
+    CONTAINS(last(), "\"message\":\"unknown template\"");
+    say(COMPLETE("9", "{\"type\":\"ref/other\",\"name\":\"greet\"}",
+                 "{\"name\":\"who\",\"value\":\"\"}", ""));
+    CONTAINS(last(), "\"id\":9,\"error\":{\"code\":-32602");
+    say(COMPLETE("10", "{\"type\":\"ref/prompt\",\"name\":\"greet\"}",
+                 "{\"name\":\"who\"}", ""));
+    CONTAINS(last(), "\"id\":10,\"error\":{\"code\":-32602");
+    say(COMPLETE("11", "{\"type\":\"ref/prompt\",\"name\":7}",
+                 "{\"name\":\"who\",\"value\":\"\"}", ""));
+    CONTAINS(last(), "\"id\":11,\"error\":{\"code\":-32602");
+    say("{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"completion/complete\","
+        "\"params\":{" META "}}");
+    CONTAINS(last(), "\"id\":12,\"error\":{\"code\":-32602");
+
+    /* A small reply keeps the values that fit and says there are more. */
+    reset(&host_full, 400, 4);
+    say(COMPLETE("13", "{\"type\":\"ref/resource\",\"uri\":\"test:///{+path}\"}",
+                 "{\"name\":\"path\",\"value\":\"\"}", ""));
+    CONTAINS(last(), "\"total\":150,\"hasMore\":true}");
+    CHECK(strlen(last()) < 400);
+
+    /* The handshake era completes too. */
+    reset(&host_full, sizeof out_buf, 4);
+    say("{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{"
+        "\"protocolVersion\":\"2025-11-25\",\"capabilities\":{}}}");
+    say("{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"completion/complete\","
+        "\"params\":{\"ref\":{\"type\":\"ref/prompt\",\"name\":\"greet\"},"
+        "\"argument\":{\"name\":\"who\",\"value\":\"g\"}}}");
+    SAME(last(), "{\"jsonrpc\":\"2.0\",\"id\":14,\"result\":{\"completion\":"
+                 "{\"values\":[\"grace\"],\"total\":1,\"hasMore\":false}}}");
+    say("{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"prompts/get\","
+        "\"params\":{\"name\":\"greet\",\"arguments\":{\"who\":\"bo\"}}}");
+    SAME(last(), "{\"jsonrpc\":\"2.0\",\"id\":15,\"result\":{\"messages\":"
+                 "[{\"role\":\"user\",\"content\":{\"type\":\"text\","
+                 "\"text\":\"Hello, bo\"}}]}}");
+}
+
+static void prompts_changed(void)
+{
+    reset(&host_full, sizeof out_buf, 4);
+    say("{\"jsonrpc\":\"2.0\",\"id\":\"L\",\"method\":\"subscriptions/listen\","
+        "\"params\":{\"notifications\":{\"promptsListChanged\":true}," META "}}");
+    SAME(last(), "{\"jsonrpc\":\"2.0\",\"method\":"
+                 "\"notifications/subscriptions/acknowledged\",\"params\":"
+                 "{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":\"L\"},"
+                 "\"notifications\":{\"promptsListChanged\":true}}}");
+    say("{\"jsonrpc\":\"2.0\",\"id\":\"R\",\"method\":\"subscriptions/listen\","
+        "\"params\":{\"notifications\":{\"resourcesListChanged\":true}," META "}}");
+    nsent = 0;
+    tinymcp_prompts_changed(&t);
+    CHECK(nsent == 1);
+    SAME(sent[0], "{\"jsonrpc\":\"2.0\",\"method\":"
+                  "\"notifications/prompts/list_changed\",\"params\":{\"_meta\":"
+                  "{\"io.modelcontextprotocol/subscriptionId\":\"L\"}}}");
+    nsent = 0;
+    tinymcp_listchanged(&t);
+    CHECK(nsent == 1);
+    CONTAINS(sent[0], "notifications/resources/list_changed");
+    CONTAINS(sent[0], "\"R\"");
+
+    /* From inside a call the notice follows the reply. */
+    nsent = 0;
+    say("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"reprompt\"," META "}}");
+    CHECK(nsent == 2);
+    CONTAINS(sent[0], "\"id\":3,\"result\"");
+    CONTAINS(sent[1], "notifications/prompts/list_changed");
+
+    /* One listen asks for both; a host without prompts drops the ask. */
+    reset(&host_full, sizeof out_buf, 4);
+    say("{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"subscriptions/listen\","
+        "\"params\":{\"notifications\":{\"resourcesListChanged\":true,"
+        "\"promptsListChanged\":true}," META "}}");
+    CONTAINS(last(), "{\"resourcesListChanged\":true,\"promptsListChanged\":true}");
+    nsent = 0;
+    tinymcp_prompts_changed(&t);
+    tinymcp_listchanged(&t);
+    CHECK(nsent == 2);
+    reset(&host, sizeof out_buf, 4);
+    say("{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"subscriptions/listen\","
+        "\"params\":{\"notifications\":{\"promptsListChanged\":true}," META "}}");
+    CONTAINS(last(), "\"notifications\":{}}}");
+    nsent = 0;
+    tinymcp_prompts_changed(&t);
+    CHECK(nsent == 0);
+
+    /* The handshake era hears it without a listen. */
+    reset(&host_full, sizeof out_buf, 4);
+    say("{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{"
+        "\"protocolVersion\":\"2025-11-25\",\"capabilities\":{}}}");
+    tinymcp_prompts_changed(&t);
+    SAME(last(), "{\"jsonrpc\":\"2.0\",\"method\":"
+                 "\"notifications/prompts/list_changed\"}");
+}
+
+static void prompt_templates(void)
+{
+    static const char tpl[] = "Hi {{who}}, {{who}} again; {{ x }} {{} "
+                              "{{lang_2}} {{a-b}} {{tail";
+    char names[4][TINYMCP_PNAME_MAX], buf[256], long_name[40];
+    tinymcp_jw_t w;
+    tinymcp_sink_t sink;
+    tinymcp_args_t args;
+
+    CHECK(tinymcp_placeholders(tpl, strlen(tpl), names, 4) == 2);
+    SAME(names[0], "who");
+    SAME(names[1], "lang_2");
+    CHECK(tinymcp_placeholders(tpl, strlen(tpl), names, 1) == 1);
+    CHECK(tinymcp_placeholders("{{x}}", 4, names, 4) == 0);
+    CHECK(tinymcp_placeholders("{{x}}", 5, names, 4) == 1);
+    /* A name of 31 characters is one; 32 is text. */
+    memset(long_name, 'n', sizeof long_name);
+    memcpy(long_name, "{{", 2);
+    memcpy(long_name + 33, "}}", 2);
+    CHECK(tinymcp_placeholders(long_name, 35, names, 4) == 1);
+    long_name[33] = 'n';
+    memcpy(long_name + 34, "}}", 2);
+    CHECK(tinymcp_placeholders(long_name, 36, names, 4) == 0);
+
+    memset(&args, 0, sizeof args);
+    args.n = 2;
+    args.a[0].key = "who";
+    args.a[0].str = "Ada";
+    args.a[1].key = "lang_2";
+    args.a[1].str = "C\"";
+    tinymcp_jw_init(&w, buf, sizeof buf);
+    tinymcp_sink_init(&sink, &w, sizeof buf);
+    CHECK(tinymcp_render(&sink, tpl, strlen(tpl), &args) == 0);
+    SAME(buf, "Hi Ada, Ada again; {{ x }} {{} C\\\" {{a-b}} {{tail");
+
+    /* A placeholder without its argument writes nothing. */
+    args.n = 1;
+    tinymcp_jw_init(&w, buf, sizeof buf);
+    tinymcp_sink_init(&sink, &w, sizeof buf);
+    CHECK(tinymcp_render(&sink, tpl, strlen(tpl), &args) == TINYMCP_EINVAL);
+    CHECK(w.len == 0);
+    /* A number is not a string argument. */
+    args.n = 2;
+    args.a[1].str = NULL;
+    CHECK(tinymcp_render(&sink, tpl, strlen(tpl), &args) == TINYMCP_EINVAL);
+}
+
 int main(void)
 {
     json_edges();
@@ -840,6 +1249,11 @@ int main(void)
     envelope_errors();
     legacy_session();
     legacy_eviction();
+    modern_identity();
+    modern_prompts();
+    modern_completion();
+    prompts_changed();
+    prompt_templates();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }
