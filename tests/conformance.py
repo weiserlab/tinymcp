@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 #
-# tinymcp v0.5
+# tinymcp v0.6
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
 # Authors: Ambuj Varshney <ambuj@tiku-os.org>
 #
-# conformance.py - the official mcp SDK client against the POSIX example in
-# every era it can speak: pinned 2026-07-28, auto-negotiated, and the
-# initialize handshake.  Each run lists, calls, reads, subscribes and sees a
-# change arrive, gets a prompt and completes a name, and follows a call the
-# server answers later: its progress, a call served meanwhile, a cancel.
+# conformance.py - the official mcp SDK client against the POSIX example,
+# pinned to 2026-07-28, auto-negotiated and through the handshake: every
+# method, consent, calls answered later, streamed, binary and typed content.
 #
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import base64
 import os
 import re
 import sys
@@ -75,7 +74,7 @@ async def common(c, mode, dirpath):
 
     tools = await c.list_tools()
     names = sorted(t.name for t in tools.tools)
-    expect(names == ["count", "counters", "echo", "remove", "shell", "whoami", "write"], f"tool names {names}")
+    expect(names == ["count", "counters", "echo", "picture", "remove", "shell", "stat", "whoami", "write"], f"tool names {names}")
     r = await c.call_tool("whoami", {})
     expect(text_of(r) == "conformance", f"the client's name {text_of(r)!r}")
     echo = next(t for t in tools.tools if t.name == "echo")
@@ -90,8 +89,8 @@ async def common(c, mode, dirpath):
     r = await c.call_tool("shell", {"line": "exit 3"})
     expect(r.is_error is True, "a failing command is a tool error")
     r = await c.call_tool("shell", {"line": "head -c 40000 /dev/zero | tr '\\0' x"})
-    expect(r.is_error is True and text_of(r).endswith("[cut]") and len(text_of(r)) < 33000,
-           f"a long output is cut: {len(text_of(r))} bytes, isError {r.is_error}")
+    expect(not r.is_error and text_of(r) == "x" * 40000,
+           f"a long output streams whole: {len(text_of(r))} bytes, isError {r.is_error}")
 
     try:
         await c.call_tool("nope", {})
@@ -208,6 +207,47 @@ async def later(c):
     n0 = int(before.split()[-1])
     expect(after.startswith("running 0 ") and int(after.split()[-1]) == n0 + 1,
            f"cancelled: {before!r} -> {after!r}")
+
+
+BIG = "".join(f"line {n:06d} of the big file\n" for n in range(4000))   # 108 KB
+PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + bytes(range(256)) * 200 + b"\x00\x01"
+
+
+async def large_and_binary(c, dirpath):
+    """Past the example's 32 KB out buffer, blobs, an image, a structure."""
+    made = {"big.txt": BIG.encode(), "logo.png": PNG}
+    for n in (1, 2, 3):
+        made[f"odd{n}.bin"] = b"\x00" + bytes(range(n))
+    for name, data in made.items():
+        with open(os.path.join(dirpath, name), "wb") as f:
+            f.write(data)
+    r = await c.read_resource("file:///big.txt")
+    got = r.contents[0].text if hasattr(r.contents[0], "text") else ""
+    expect(got == BIG, f"a 108 KB file read whole: {len(got)} of {len(BIG)} bytes")
+    r = await c.call_tool("shell", {"line": f"cat {os.path.join(dirpath, 'big.txt')}"})
+    expect(text_of(r) == BIG and not r.is_error,
+           f"a 108 KB tool result whole: {len(text_of(r))} bytes")
+    r = await c.read_resource("file:///logo.png")
+    b = r.contents[0]
+    expect(isinstance(b, types.BlobResourceContents) and b.mime_type == "image/png" and
+           base64.b64decode(b.blob) == PNG,
+           f"a binary file is a blob: {type(b).__name__} {getattr(b, 'mime_type', None)}")
+    for n in (1, 2, 3):
+        r = await c.read_resource(f"file:///odd{n}.bin")
+        expect(base64.b64decode(r.contents[0].blob) == b"\x00" + bytes(range(n)),
+               f"a {n + 1}-byte blob's padding")
+    r = await c.call_tool("picture", {"name": "logo.png"})
+    img = r.content[0] if r.content else None
+    expect(isinstance(img, types.ImageContent) and img.mime_type == "image/png" and
+           base64.b64decode(img.data) == PNG and not r.is_error,
+           f"an image result: {type(img).__name__}")
+    tools = {t.name: t for t in (await c.list_tools()).tools}
+    r = await c.call_tool("stat", {"name": "a.txt"})
+    expect(tools["stat"].output_schema is not None and
+           r.structured_content == {"name": "a.txt", "size": 14} and not r.is_error,
+           f"structured content {r.structured_content}")
+    for name in made:
+        os.remove(os.path.join(dirpath, name))
 
 
 async def prompts_and_completion(c):
@@ -330,6 +370,7 @@ async def run(mode, exe):
                    f"protocol version {c.protocol_version}, want {want}")
             await common(c, mode, dirpath)
             await later(c)
+            await large_and_binary(c, dirpath)
             if mode == "legacy":
                 await legacy_subscriptions(c, seen)
             else:

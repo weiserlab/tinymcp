@@ -1,5 +1,5 @@
 /*
- * tinymcp v0.5
+ * tinymcp v0.6
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
@@ -7,9 +7,9 @@
  *
  * tinymcp_posix.c - an MCP server over stdin and stdout that serves the
  * files of one directory as resources, its prompt.<name> files as prompts,
- * completes file names, runs lines through the shell, and counts slowly
- * in a call it answers later: the conformance target, and the shape a
- * binding takes on any host.
+ * completes file names, runs lines through the shell, counts slowly in a
+ * call it answers later, and streams what does not fit its buffer: the
+ * conformance target, and the shape a binding takes on any host.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -121,10 +121,27 @@ static int list(void *ctx, unsigned cursor, tinymcp_list_t *out)
 }
 
 /* The file's text, from line on, at most bytes of it when bytes is set. */
+/* The MIME type of a file whose first 512 bytes hold a NUL, or NULL for
+ * text: image/png by its name, application/octet-stream otherwise. */
+static const char *binary_mime(FILE *f, const char *name)
+{
+    char head[512];
+    size_t n = fread(head, 1, sizeof head, f);
+    size_t k = strlen(name);
+
+    rewind(f);
+    if (!memchr(head, 0, n))
+        return NULL;
+    if (k > 4 && !strcmp(name + k - 4, ".png"))
+        return "image/png";
+    return "application/octet-stream";
+}
+
 static int read_file(void *ctx, const char *uri, unsigned line, unsigned bytes,
                      tinymcp_sink_t *text)
 {
     const char *name = uri_name(uri);
+    const char *mime;
     char path[512];
     FILE *f;
     int c;
@@ -133,9 +150,14 @@ static int read_file(void *ctx, const char *uri, unsigned line, unsigned bytes,
     (void)ctx;
     if (!name || path_of(name, path, sizeof path))
         return TINYMCP_ENOENT;
-    f = fopen(path, "r");
+    f = fopen(path, "rb");
     if (!f)
         return errno == ENOENT ? TINYMCP_ENOENT : TINYMCP_EIO;
+    mime = binary_mime(f, name);
+    if (mime) {
+        tinymcp_sink_binary(text, mime);
+        line = 0;
+    }
     while ((c = fgetc(f)) != EOF) {
         if (skipped < line) {
             if (c == '\n')
@@ -154,26 +176,34 @@ static int read_file(void *ctx, const char *uri, unsigned line, unsigned bytes,
 static const tinymcp_tool_t tools[] = {
     { "shell", "Run one line through /bin/sh and return what it printed.",
       "{\"type\":\"object\",\"properties\":{\"line\":{\"type\":\"string\","
-      "\"description\":\"the command line\"}},\"required\":[\"line\"]}" },
+      "\"description\":\"the command line\"}},\"required\":[\"line\"]}", NULL },
     { "write", "Write text to a file in the served directory, creating it.",
       "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},"
-      "\"text\":{\"type\":\"string\"}},\"required\":[\"name\",\"text\"]}" },
+      "\"text\":{\"type\":\"string\"}},\"required\":[\"name\",\"text\"]}", NULL },
     { "echo", "Return the text given.",
       "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},"
-      "\"required\":[\"text\"]}" },
+      "\"required\":[\"text\"]}", NULL },
     { "whoami", "Return the name the client gave in its clientInfo.",
-      "{\"type\":\"object\"}" },
+      "{\"type\":\"object\"}", NULL },
     { "remove", "Delete a file of the served directory, after the person "
       "says yes.",
       "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},"
-      "\"required\":[\"name\"]}" },
+      "\"required\":[\"name\"]}", NULL },
     { "count", "Count from 1 to the number given, one every ms milliseconds "
       "(100 when absent), with progress for each; the result comes at the "
       "end.",
       "{\"type\":\"object\",\"properties\":{\"to\":{\"type\":\"integer\"},"
-      "\"ms\":{\"type\":\"integer\"}},\"required\":[\"to\"]}" },
+      "\"ms\":{\"type\":\"integer\"}},\"required\":[\"to\"]}", NULL },
     { "counters", "Return the counts running, finished and cancelled.",
-      "{\"type\":\"object\"}" },
+      "{\"type\":\"object\"}", NULL },
+    { "picture", "Return a file of the served directory as an image.",
+      "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},"
+      "\"required\":[\"name\"]}", NULL },
+    { "stat", "Return a file's name and size as structured content.",
+      "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},"
+      "\"required\":[\"name\"]}",
+      "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},"
+      "\"size\":{\"type\":\"integer\"}},\"required\":[\"name\",\"size\"]}" },
 };
 
 /* The counts in progress, one per kept call. */
@@ -433,6 +463,38 @@ static int call(void *ctx, const char *name, const tinymcp_args_t *args,
     }
     if (!strcmp(name, "count"))
         return count_start(args, text);
+    if (!strcmp(name, "picture") || !strcmp(name, "stat")) {
+        const char *fname = tinymcp_arg_str(args, "name");
+        static char json[NAME_MAX_LEN + 64];
+        char path[512];
+        struct stat st;
+        FILE *f;
+        int c;
+
+        if (!fname || strpbrk(fname, "/\"\\") ||
+            path_of(fname, path, sizeof path) ||
+            stat(path, &st) != 0) {
+            tinymcp_sink_puts(text, "no such file");
+            return TINYMCP_TOOL_ERROR;
+        }
+        if (!strcmp(name, "stat")) {
+            snprintf(json, sizeof json, "{\"name\":\"%s\",\"size\":%ld}",
+                     fname, (long)st.st_size);
+            tinymcp_sink_puts(text, json);
+            tinymcp_structured(&server, json);
+            return TINYMCP_OK;
+        }
+        f = fopen(path, "rb");
+        if (!f || tinymcp_sink_binary(text, "image/png") != 0) {
+            if (f)
+                fclose(f);
+            return TINYMCP_EIO;
+        }
+        while ((c = fgetc(f)) != EOF)
+            tinymcp_sink_putc(text, (char)c);
+        fclose(f);
+        return TINYMCP_OK;
+    }
     if (!strcmp(name, "counters")) {
         char line[64];
         unsigned i, running = 0;
@@ -532,6 +594,20 @@ static int send_line(void *ctx, const char *msg, size_t len)
     return 0;
 }
 
+/* A message in pieces: each piece as it comes, the newline after the last. */
+static int send_piece(void *ctx, const char *bytes, size_t len, int last)
+{
+    (void)ctx;
+    if (trace)
+        fprintf(stderr, "<- %.*s%s", (int)len, bytes, last ? "\n" : "");
+    if (fwrite(bytes, 1, len, stdout) != len ||
+        (last && fputc('\n', stdout) == EOF))
+        return -1;
+    if (last)
+        fflush(stdout);
+    return 0;
+}
+
 static const tinymcp_host_t host = {
     "tinymcp-posix", TINYMCP_VERSION,
     "The files of one directory are resources; the shell tool runs a line "
@@ -539,7 +615,7 @@ static const tinymcp_host_t host = {
     tools, sizeof tools / sizeof tools[0],
     templates, sizeof templates / sizeof templates[0],
     list, read_file, call, watch, unwatch, send_line,
-    "tinymcp on POSIX", prompt_list, prompt_get, complete, cancel
+    "tinymcp on POSIX", prompt_list, prompt_get, complete, cancel, send_piece
 };
 
 int main(int argc, char **argv)

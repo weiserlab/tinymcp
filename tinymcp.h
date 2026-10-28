@@ -1,5 +1,5 @@
 /*
- * tinymcp v0.5
+ * tinymcp v0.6
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
@@ -24,8 +24,8 @@
 extern "C" {
 #endif
 
-#define TINYMCP_VERSION  "0.5.0"
-#define TINYMCP_API      3             /* bumped on any change to tinymcp_host_t */
+#define TINYMCP_VERSION  "0.6.0"
+#define TINYMCP_API      4             /* bumped on any change to tinymcp_host_t */
 #define TINYMCP_PROTOCOL "2026-07-28"  /* the newest revision served */
 
 #ifndef TINYMCP_SUBS_MAX
@@ -72,6 +72,7 @@ typedef struct tinymcp_tool {
     const char *name;
     const char *description;   /* may be NULL */
     const char *input_schema;  /* a JSON Schema object as JSON text */
+    const char *output_schema; /* its structuredContent's schema; may be NULL */
 } tinymcp_tool_t;
 
 typedef struct tinymcp_template {
@@ -238,6 +239,13 @@ typedef struct tinymcp_host {
      * May be NULL.
      */
     void (*cancel)(void *ctx, unsigned call);
+    /*
+     * One piece of a message, last set on the piece that ends it.  With it,
+     * a resource's text, a tool's content and a kept call's result go out
+     * as they are written, past the out buffer; without it they are cut
+     * there.  Messages that fit still go whole through send.  May be NULL.
+     */
+    int (*send_part)(void *ctx, const char *bytes, size_t len, int last);
 } tinymcp_host_t;
 
 #define TINYMCP_LC_RESOURCES 1u   /* listchanged: resources/list_changed */
@@ -290,6 +298,8 @@ typedef struct tinymcp {
     tinymcp_later_t later[TINYMCP_LATER_MAX];
     unsigned char later_open;   /* the call whose result is being written, or 0 */
     tinymcp_jw_t later_w;
+    size_t later_mark;          /* where that result's content begins */
+    const char *structured;     /* the tool result's structuredContent, or NULL */
     unsigned char busy;         /* inside a request: notifications wait */
     unsigned pending;           /* slots whose update waits, one bit each */
     unsigned char pending_lc;   /* TINYMCP_LC_* notices that wait */
@@ -394,6 +404,13 @@ int tinymcp_request_state(const tinymcp_t *t, char *buf, size_t cap);
  * may be called from inside a host function: they return -1 there.
  */
 
+/**
+ * Inside tool_call, or between tinymcp_result_begin() and _end(): json, an
+ * object as text that outlives the call, becomes the result's
+ * structuredContent; it must fit a tool's output_schema when it has one.
+ */
+void tinymcp_structured(tinymcp_t *t, const char *json);
+
 /** Inside tool_call: keep this call open.  Its handle, 1 or more, or 0
  *  when TINYMCP_LATER_MAX calls are kept or its id does not fit. */
 unsigned tinymcp_defer(tinymcp_t *t);
@@ -413,8 +430,8 @@ int tinymcp_result_begin(tinymcp_t *t, unsigned call, tinymcp_sink_t *text);
 
 /** Send the result tinymcp_result_begin() opened, with that sink; the call
  *  is then gone.  isError is true for is_error or for text that was cut. */
-void tinymcp_result_end(tinymcp_t *t, unsigned call,
-                        const tinymcp_sink_t *text, int is_error);
+void tinymcp_result_end(tinymcp_t *t, unsigned call, tinymcp_sink_t *text,
+                        int is_error);
 
 #ifdef __cplusplus
 }

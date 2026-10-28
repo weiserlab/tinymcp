@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# tinymcp v0.5
+# tinymcp v0.6
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
@@ -34,7 +34,7 @@ KEYS = ["protocol", "identity", "tools", "read", "read-tool", "list",
         "journal", "consent-no", "consent-yes", "consent-hidden",
         "consent-journal", "job-run", "job-progress", "job-meanwhile", "job-background",
         "job-one", "job-stop", "job-cancel", "job-budget", "job-confined",
-        "job-journal"]
+        "job-journal", "stream-read", "stream-tool", "structured"]
 CLIENT = "board-smoke"
 
 PROMPT = "/data/prompt.smoke"
@@ -104,6 +104,7 @@ async def run(mode, port):
         expect("commands", "help" in r.contents[0].text, "command table resource")
         r = await c.read_resource("tiku:///sys/vfs/manifest?line=1&bytes=200")
         expect("page", 0 < len(r.contents[0].text) <= 200, f"{len(r.contents[0].text)} bytes of the manifest")
+        await streamed(c)
         r = await c.call_tool("ls", {"path": "/dev"})
         expect("ls", "led0" in text_of(r), f"ls /dev: {text_of(r)[:40]!r}")
         r = await c.call_tool("write", {"path": "/dev/led0", "value": "1"})
@@ -257,6 +258,29 @@ async def consent(c, mode):
     expect("consent-journal", f"{CLIENT} allowed: change the CPU clock" in j and
            f"{CLIENT} asked consent: reboot the board" in j,
            " | ".join(j.splitlines()[-4:]))
+
+
+OUT_CAP = 4608   # the board's reply buffer on a Cortex-M
+
+
+async def streamed(c):
+    """Past the reply buffer in one request; a typed node's value."""
+    whole = (await c.read_resource("tiku:///sys/vfs/manifest")).contents[0].text
+    head = (await c.read_resource("tiku:///sys/vfs/manifest?line=0&bytes=300")).contents[0].text
+    lines = whole.splitlines()
+    expect("stream-read", len(whole) > OUT_CAP and "[cut]" not in whole and
+           whole.startswith(head) and whole.endswith("\n") and
+           all(line.count("\t") >= 3 for line in lines[1:]),
+           f"{len(whole)} bytes, {len(lines)} lines in one resources/read")
+    r = await c.call_tool("read", {"path": "/sys/vfs/manifest"})
+    expect("stream-tool", not r.is_error and text_of(r) == whole,
+           f"{len(text_of(r))} bytes from the read tool")
+    r = await c.call_tool("read", {"path": "/sys/cpu/freq"})
+    plain = await c.call_tool("read", {"path": "/sys/device/name"})
+    sc = r.structured_content or {}
+    expect("structured", sc.get("unit") == "Hz" and sc.get("value") == int(text_of(r)) and
+           plain.structured_content is None,
+           f"{text_of(r).strip()!r} -> {sc}; name {plain.structured_content}")
 
 
 async def node(c, path):

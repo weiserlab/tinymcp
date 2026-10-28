@@ -1,5 +1,5 @@
 /*
- * tinymcp v0.5
+ * tinymcp v0.6
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
@@ -7,8 +7,9 @@
  *
  * test_tinymcp.c - the protocol against a fake host: both eras, every
  * method, every error code, the buffers' edges, subscriptions and their
- * eviction, prompts and completion, calls answered later.  Each check is
- * known to fail on a mutant (tests/mutants.sh).
+ * eviction, prompts and completion, calls answered later, streamed,
+ * binary and structured content.  Each check is known to fail on a mutant
+ * (tests/mutants.sh).
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -35,6 +36,36 @@ static unsigned kept;             /* the handle the slow tool was given */
 static unsigned cancelled[4];     /* the calls host->cancel was told of */
 static unsigned ncancelled;
 static int inside_progress, inside_begin;  /* what they returned in a call */
+static char parts[65536];         /* the pieces send_part was given, joined */
+static size_t parts_len;
+static int nparts, nlast, part_fail;
+static int binary_rc;             /* what tinymcp_sink_binary() returned */
+
+static int fake_send_part(void *ctx, const char *bytes, size_t len, int last)
+{
+    (void)ctx;
+    if (part_fail && nparts + 1 >= part_fail)
+        return -1;
+    if (parts_len + len < sizeof parts) {
+        memcpy(parts + parts_len, bytes, len);
+        parts_len += len;
+        parts[parts_len] = 0;
+    }
+    nparts++;
+    nlast += last;
+    return 0;
+}
+
+/* n bytes 0, 1, 2 ... as binary content of type mime. */
+static int binary(tinymcp_sink_t *text, const char *mime, unsigned n)
+{
+    unsigned i;
+
+    binary_rc = tinymcp_sink_binary(text, mime);
+    for (i = 0; i < n; i++)
+        tinymcp_sink_putc(text, (char)(i & 0xFF));
+    return 0;
+}
 
 static int fake_send(void *ctx, const char *msg, size_t len)
 {
@@ -91,6 +122,22 @@ static int fake_read(void *ctx, const char *uri, unsigned line, unsigned bytes,
     }
     if (!strcmp(uri, "test:///effect"))
         return TINYMCP_EEFFECT;
+    if (!strcmp(uri, "test:///empty"))
+        return 0;
+    if (!strcmp(uri, "test:///bin"))
+        return binary(text, "image/png", bytes);
+    if (!strcmp(uri, "test:///mixed")) {
+        tinymcp_sink_puts(text, "a");
+        binary_rc = tinymcp_sink_binary(text, "image/png");
+        return 0;
+    }
+    if (!strcmp(uri, "test:///late")) {
+        int i;
+
+        for (i = 0; i < 1000; i++)
+            tinymcp_sink_putc(text, 'l');
+        return TINYMCP_ENOENT;
+    }
     if (!strcmp(uri, "test:///defer")) {
         tinymcp_sink_puts(text, tinymcp_defer(touch_target) ? "kept" : "not kept");
         return 0;
@@ -110,18 +157,18 @@ static int fake_read(void *ctx, const char *uri, unsigned line, unsigned bytes,
 static const tinymcp_tool_t tools[] = {
     { "echo", "says text back",
       "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},"
-      "\"required\":[\"text\"]}" },
+      "\"required\":[\"text\"]}", NULL },
     { "add", NULL,
       "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"integer\"},"
-      "\"b\":{\"type\":\"integer\"}}}" },
-    { "fail", "always a tool error", "{\"type\":\"object\"}" },
-    { "boom", "a protocol error", "{\"type\":\"object\"}" },
-    { "long", "more than fits", "{\"type\":\"object\"}" },
-    { "touch", "notifies slot 0 from inside the call", "{\"type\":\"object\"}" },
-    { "flag", "a boolean", "{\"type\":\"object\"}" },
-    { "reprompt", "prompts changed, from inside the call", "{\"type\":\"object\"}" },
-    { "guarded", "asks the person first", "{\"type\":\"object\"}" },
-    { "lazy", "needs input it does not describe", "{\"type\":\"object\"}" },
+      "\"b\":{\"type\":\"integer\"}}}", NULL },
+    { "fail", "always a tool error", "{\"type\":\"object\"}", NULL },
+    { "boom", "a protocol error", "{\"type\":\"object\"}", NULL },
+    { "long", "more than fits", "{\"type\":\"object\"}", NULL },
+    { "touch", "notifies slot 0 from inside the call", "{\"type\":\"object\"}", NULL },
+    { "flag", "a boolean", "{\"type\":\"object\"}", NULL },
+    { "reprompt", "prompts changed, from inside the call", "{\"type\":\"object\"}", NULL },
+    { "guarded", "asks the person first", "{\"type\":\"object\"}", NULL },
+    { "lazy", "needs input it does not describe", "{\"type\":\"object\"}", NULL },
 };
 #define NTOOLS (sizeof tools / sizeof tools[0])
 
@@ -232,6 +279,22 @@ static int fake_tool(void *ctx, const char *name, const tinymcp_args_t *args,
         inside_begin = tinymcp_result_begin(touch_target, kept, &other);
         tinymcp_sink_puts(text, "inside");
         return TINYMCP_OK;
+    }
+    if (!strcmp(name, "pic"))
+        return binary(text, "image/png", (unsigned)tinymcp_arg_int(args, "n", 4));
+    if (!strcmp(name, "pdf"))
+        return binary(text, "application/pdf", 4);
+    if (!strcmp(name, "stat")) {
+        tinymcp_structured(touch_target, "{\"n\":1}");
+        tinymcp_sink_puts(text, "{\"n\":1}");
+        return TINYMCP_OK;
+    }
+    if (!strcmp(name, "latefail")) {
+        int i;
+
+        for (i = 0; i < 1000; i++)
+            tinymcp_sink_putc(text, 'f');
+        return -32050;
     }
     if (!strcmp(name, "flag")) {
         tinymcp_sink_puts(text, tinymcp_arg_bool(args, "on", 0) ? "on" : "off");
@@ -358,14 +421,14 @@ static const tinymcp_host_t host = {
     "fake", "9.9", "Be nice to the fake.",
     tools, NTOOLS, templates, 2,
     fake_list, fake_read, fake_tool, fake_watch, fake_unwatch, fake_send,
-    NULL, NULL, NULL, NULL, NULL
+    NULL, NULL, NULL, NULL, NULL, NULL
 };
 
 static const tinymcp_host_t host_full = {
     "fake", "9.9", "Be nice to the fake.",
     tools, NTOOLS, templates, 2,
     fake_list, fake_read, fake_tool, fake_watch, fake_unwatch, fake_send,
-    "The Fake", fake_prompt_list, fake_prompt_get, fake_complete, NULL
+    "The Fake", fake_prompt_list, fake_prompt_get, fake_complete, NULL, NULL
 };
 
 static void fake_cancel(void *ctx, unsigned call)
@@ -377,25 +440,48 @@ static void fake_cancel(void *ctx, unsigned call)
 }
 
 static const tinymcp_tool_t later_tools[] = {
-    { "slow", NULL, "{\"type\":\"object\"}" },
-    { "slow2", NULL, "{\"type\":\"object\"}" },
-    { "keepnot", NULL, "{\"type\":\"object\"}" },
-    { "nokeep", NULL, "{\"type\":\"object\"}" },
-    { "inside", NULL, "{\"type\":\"object\"}" },
+    { "slow", NULL, "{\"type\":\"object\"}", NULL },
+    { "slow2", NULL, "{\"type\":\"object\"}", NULL },
+    { "keepnot", NULL, "{\"type\":\"object\"}", NULL },
+    { "nokeep", NULL, "{\"type\":\"object\"}", NULL },
+    { "inside", NULL, "{\"type\":\"object\"}", NULL },
 };
 
 static const tinymcp_host_t host_later = {
     "fake", "9.9", NULL,
     later_tools, sizeof later_tools / sizeof later_tools[0], templates, 2,
     fake_list, fake_read, fake_tool, fake_watch, fake_unwatch, fake_send,
-    "The Fake", NULL, NULL, NULL, fake_cancel
+    "The Fake", NULL, NULL, NULL, fake_cancel, NULL
+};
+
+static const tinymcp_tool_t content_tools[] = {
+    { "long", NULL, "{\"type\":\"object\"}", NULL },
+    { "pic", NULL, "{\"type\":\"object\"}", NULL },
+    { "pdf", NULL, "{\"type\":\"object\"}", NULL },
+    { "stat", NULL, "{\"type\":\"object\"}", "{\"type\":\"object\"}" },
+    { "latefail", NULL, "{\"type\":\"object\"}", NULL },
+    { "slow", NULL, "{\"type\":\"object\"}", NULL },
+};
+
+static const tinymcp_host_t host_content = {
+    "fake", "9.9", NULL,
+    content_tools, sizeof content_tools / sizeof content_tools[0], templates, 2,
+    fake_list, fake_read, fake_tool, fake_watch, fake_unwatch, fake_send,
+    NULL, NULL, NULL, NULL, NULL, NULL
+};
+
+static const tinymcp_host_t host_stream = {
+    "fake", "9.9", NULL,
+    content_tools, sizeof content_tools / sizeof content_tools[0], templates, 2,
+    fake_list, fake_read, fake_tool, fake_watch, fake_unwatch, fake_send,
+    NULL, NULL, NULL, NULL, NULL, fake_send_part
 };
 
 static const tinymcp_host_t host_plain = {
     "plain", "1", NULL,
     tools, 1, NULL, 0,
     NULL, NULL, fake_tool, NULL, NULL, fake_send,
-    NULL, NULL, NULL, NULL, NULL
+    NULL, NULL, NULL, NULL, NULL, NULL
 };
 
 /* The checks */
@@ -1612,6 +1698,139 @@ static void later_calls(void)
     CHECK(t.errors == 1 && !t.busy);
 }
 
+#define READ(id, uri) "{\"jsonrpc\":\"2.0\",\"id\":" id ",\"method\":" \
+    "\"resources/read\",\"params\":{\"uri\":\"" uri "\"," META "}}"
+
+static void parts_reset(void)
+{
+    parts_len = 0;
+    parts[0] = 0;
+    nparts = nlast = part_fail = 0;
+}
+
+/* Binary content as base64, refused where it cannot be; structuredContent
+ * and outputSchema. */
+static void content_kinds(void)
+{
+    tinymcp_jw_t w;
+    tinymcp_sink_t plain;
+    char buf[32];
+
+    reset(&host_content, sizeof out_buf, 4);
+    say(READ("1", "test:///bin?bytes=4"));
+    CONTAINS(last(), "\"contents\":[{\"uri\":\"test:///bin?bytes=4\",\"mimeType\":"
+                     "\"image/png\",\"blob\":\"AAECAw==\"}]");
+    CHECK(binary_rc == 0);
+    say(READ("2", "test:///bin?bytes=1"));
+    CONTAINS(last(), "\"blob\":\"AA==\"}");
+    say(READ("3", "test:///bin?bytes=3"));
+    CONTAINS(last(), "\"blob\":\"AAEC\"}");
+    say(READ("4", "test:///bin?bytes=0"));
+    CONTAINS(last(), "\"blob\":\"\"}");
+    say(READ("5", "test:///bin?bytes=256"));
+    CONTAINS(last(), "/P3+/w==\"}");
+    /* Text first, then binary: refused, and the text stands. */
+    say(READ("6", "test:///mixed"));
+    CHECK(binary_rc == -1);
+    CONTAINS(last(), "\"mimeType\":\"text/plain\",\"text\":\"a\"}]");
+    /* An empty text still opens as text. */
+    say(READ("7", "test:///empty"));
+    CONTAINS(last(), "\"uri\":\"test:///empty\",\"mimeType\":\"text/plain\","
+                     "\"text\":\"\"}]");
+    /* A tool's image, and a type a tool cannot carry. */
+    say(CALL("8", "pic", META));
+    CONTAINS(last(), "\"content\":[{\"type\":\"image\",\"mimeType\":\"image/png\","
+                     "\"data\":\"AAECAw==\"}]");
+    LACKS(last(), "isError");
+    say(CALL("9", "pdf", META));
+    CHECK(binary_rc == -1);
+    CONTAINS(last(), "\"content\":[{\"type\":\"text\",\"text\":\"\\u0000\\u0001");
+    /* Binary past the buffer, with no send_part: an error, never half. */
+    say(READ("10", "test:///bin?bytes=5000"));
+    SAME(last(), "{\"jsonrpc\":\"2.0\",\"id\":10,\"error\":{\"code\":-32603,"
+                 "\"message\":\"the resource does not fit the out buffer\"}}");
+    say("{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":"
+        "{\"name\":\"pic\",\"arguments\":{\"n\":5000}," META "}}");
+    CONTAINS(last(), "\"content\":[{\"type\":\"text\",\"text\":\"the content does "
+                     "not fit the out buffer\"}],\"isError\":true}}");
+    /* structuredContent after the content; outputSchema in the list. */
+    say(CALL("12", "stat", META));
+    CONTAINS(last(), "\"text\":\"{\\\"n\\\":1}\"}],\"structuredContent\":{\"n\":1}}}");
+    CHECK(t.structured == NULL);
+    say(CALL("13", "long", META));
+    LACKS(last(), "structuredContent");
+    CHECK(t.structured == NULL);
+    say("{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/list\",\"params\":{"
+        META "}}");
+    CONTAINS(last(), "{\"name\":\"stat\",\"inputSchema\":{\"type\":\"object\"},"
+                     "\"outputSchema\":{\"type\":\"object\"}}");
+    CONTAINS(last(), "{\"name\":\"pic\",\"inputSchema\":{\"type\":\"object\"}}");
+    /* A sink the caller opened carries text only. */
+    tinymcp_jw_init(&w, buf, sizeof buf);
+    tinymcp_sink_init(&plain, &w, sizeof buf);
+    CHECK(tinymcp_sink_binary(&plain, "image/png") == -1);
+}
+
+/* With send_part, content past the out buffer goes out in pieces. */
+static void streaming(void)
+{
+    tinymcp_sink_t text;
+    unsigned i;
+    int whole;
+
+    reset(&host_stream, 256, 4);
+    parts_reset();
+    /* A reply that fits still goes whole through send. */
+    say(READ("1", "test:///b"));
+    CHECK(nparts == 0 && nsent == 1);
+    CONTAINS(last(), "\"text\":\"bravo\"}]");
+    say(READ("2", "test:///long"));
+    CHECK(nparts > 40 && nlast == 1 && nsent == 1);
+    CHECK(!strncmp(parts, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{", 34));
+    CHECK(strstr(parts, "x\"}],\"ttlMs\":0,\"cacheScope\":\"private\"}}") != NULL);
+    LACKS(parts, "[cut]");
+    for (i = 0, whole = 1; i < 20001; i++)
+        if (strstr(parts, "\"text\":\"")[8 + i] != (i < 20000 ? 'x' : '"'))
+            whole = 0;
+    CHECK(whole);
+    /* A tool's text, and a key written after a piece went (its comma). */
+    parts_reset();
+    say(CALL("3", "long", META));
+    CHECK(nparts > 40 && nlast == 1);
+    CHECK(strstr(parts, "yyyy\"}]}}") != NULL);
+    LACKS(parts, "[cut]");
+    parts_reset();
+    say(CALL("4", "latefail", META));
+    CHECK(strstr(parts, "ffff\"}],\"isError\":true}}") != NULL && t.errors == 1);
+    parts_reset();
+    say(READ("5", "test:///late"));
+    CHECK(strstr(parts, "llll\"}],\"ttlMs\"") != NULL && t.errors == 2);
+    /* Binary streams too. */
+    parts_reset();
+    say(READ("6", "test:///bin?bytes=3000"));
+    CHECK(nparts > 10 && strstr(parts, "\"blob\":\"AAECAwQF") != NULL &&
+          strstr(parts, "\"}],\"ttlMs\"") != NULL);
+    /* A kept call's result streams. */
+    parts_reset();
+    say(CALL("7", "slow", META));
+    CHECK(tinymcp_result_begin(&t, kept, &text) == 0);
+    for (i = 0; i < 5000; i++)
+        tinymcp_sink_putc(&text, 'k');
+    tinymcp_result_end(&t, kept, &text, 0);
+    CHECK(nparts > 10 && nlast == 1 && strstr(parts, "kkkk\"}]}}") != NULL);
+    /* A transport that fails mid-message: dropped, and the message still
+     * gets its last piece; one that fails at the first gets a whole error. */
+    parts_reset();
+    part_fail = 3;
+    say(READ("8", "test:///long"));
+    CHECK(t.dropped == 1 && nparts == 2);
+    parts_reset();
+    part_fail = 1;
+    say(READ("9", "test:///long"));
+    SAME(last(), "{\"jsonrpc\":\"2.0\",\"id\":9,\"error\":{\"code\":-32603,"
+                 "\"message\":\"reply does not fit the out buffer\"}}");
+}
+
 int main(void)
 {
     json_edges();
@@ -1634,6 +1853,8 @@ int main(void)
     consent();
     consent_accessors();
     later_calls();
+    content_kinds();
+    streaming();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

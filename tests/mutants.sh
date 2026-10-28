@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# tinymcp v0.5
+# tinymcp v0.6
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
@@ -58,8 +58,8 @@ mutate legacy-era-sticky tinymcp.c 's/r->t->era = TINYMCP_ERA_LEGACY;/r->t->era 
 mutate quote-escape tinymcp_json.c "s/e\\[1\\] = '\"';/e[1] = 'Q';/"
 mutate surrogate-pair tinymcp_json.c 's/cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);/cp = 0xFFFD;/'
 mutate separator tinymcp_json.c "s/if (c == '{' || c == '\\[' || c == ':')/if (0)/"
-mutate writer-off-by-one tinymcp_json.c 's/if (w->len + n >= w->cap) {/if (w->len + n > w->cap) {/'
-mutate sink-limit tinymcp_json.c 's/if (s->w->len + k > s->limit || s->w->len + k >= s->w->cap) {/if (s->w->len + k >= s->w->cap) {/'
+mutate writer-off-by-one tinymcp_json.c 's/while (w->len + n >= w->cap) {/while (w->len + n > w->cap) {/'
+mutate sink-limit tinymcp_json.c 's/    return s->w->len + k <= s->limit \&\& s->w->len + k < s->w->cap;/    return s->w->len + k < s->w->cap;/'
 
 mutate no-title tinymcp.c 's/    if (h->title) {/    if (0) {/'
 mutate no-library-meta tinymcp.c 's/        if (library)$/        if (0)/'
@@ -109,9 +109,26 @@ mutate later-long-id tinymcp.c 's/        if (id_text(\&t->cur_id, l->id, sizeof
 mutate later-no-flush tinymcp.c '/^void tinymcp_result_end/,/^}/s/    flush_pending(t);/    ;/'
 mutate later-busy-stuck tinymcp.c '/^void tinymcp_result_end/,/^}/s/    t->busy = 0;/    ;/'
 mutate later-not-dropped tinymcp.c 's/    later_drop(t, call - 1, 0);/    ;/'
-mutate later-full tinymcp.c 's/    if (w->full) {/    if (0) {/'
+mutate later-full tinymcp.c '/^void tinymcp_result_end/,/^}/s/    if (w->full \&\& !w->sent) {/    if (0) {/'
 mutate later-end-unopened tinymcp.c 's/    if (!l || t->later_open != call)/    if (!l)/'
 mutate later-state-left tinymcp.c '/^out:$/,/busy = 0/s/    t->deferred = 0;/    ;/'
+
+mutate stream-off tinymcp.c 's/    if (t->host->send_part)$/    if (0)/'
+mutate emit-whole tinymcp.c '/^static void emit/,/^}/s/    if (w->sent) {$/    if (0) {/'
+mutate stream-limited tinymcp_json.c '/^static int sink_room/,/^}/s/    if (s->w->flush)$/    if (0)/'
+mutate b64-pad tinymcp_json.c 's/    g\[2\] = s->held > 1 ?/    g[2] = s->held > 0 ?/'
+mutate b64-alphabet tinymcp_json.c 's/"0123456789+\/";/"0123456789-_";/'
+mutate binary-after-text tinymcp_json.c 's/    if (s->opened || s->kind == TINYMCP_SINK_OPEN)/    if (s->kind == TINYMCP_SINK_OPEN)/'
+mutate tool-any-type tinymcp_json.c '/type = "audio"/,/return -1/s/            return -1;/            type = "image";/'
+mutate end-no-open tinymcp_json.c '/^void tinymcp_sink_end/,/^}/s/    sink_open(s);/    ;/'
+mutate end-no-tail tinymcp_json.c '/^void tinymcp_sink_end/,/^}/s/        b64_group(s);/        ;/'
+mutate blob-cut tinymcp.c 's/    if (sink.cut \&\& sink.b64) {/    if (0) {/'
+mutate content-bin-cut tinymcp.c 's/    if (sink->cut \&\& sink->b64) {/    if (0) {/'
+mutate structured-dropped tinymcp.c 's/    if (t->structured) {/    if (0) {/'
+mutate structured-sticky tinymcp.c '/^out:$/,/busy = 0/s/    t->structured = NULL;/    ;/'
+mutate output-schema tinymcp.c 's/        if (tool->output_schema) {/        if (0) {/'
+mutate late-read-error tinymcp.c '/it ends, short/,/errors++/s/        r->t->errors++;/        ;/'
+mutate late-tool-error tinymcp.c '/a failure is isError/,/rc = TINYMCP_TOOL_ERROR;/s/        rc = TINYMCP_TOOL_ERROR;/        ;/'
 
 echo "$total mutants, $survived survived"
 [ "$survived" -eq 0 ]

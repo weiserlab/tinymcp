@@ -30,11 +30,11 @@ hygiene/                        the commit and style checks
 
 | Measured on 2026-10-28 | |
 |---|---|
-| code, `-Os`, Cortex-M33 (`make size`) | 16.0 KB (`tinymcp.c` 13.9 KB, `tinymcp_json.c` 2.1 KB) |
-| code, `-Os`, Cortex-M0+ | 16.3 KB |
-| one instance, `tinymcp_t`, four subscription slots, two kept calls, Cortex-M33 | 868 bytes |
+| code, `-Os`, Cortex-M33 (`make size`) | 17.2 KB (`tinymcp.c` 14.4 KB, `tinymcp_json.c` 2.8 KB) |
+| code, `-Os`, Cortex-M0+ | 17.4 KB |
+| one instance, `tinymcp_t`, four subscription slots, two kept calls, Cortex-M33 | 888 bytes |
 | stack during a tool call | about 1 KB (the argument table) |
-| buffers | the host's: the in buffer holds one request, the out buffer one reply |
+| buffers | the host's: the in buffer holds one request, the out buffer one reply, or one piece of a longer one |
 
 ## Binding it
 
@@ -114,8 +114,19 @@ the handshake era, from each request's `_meta` for the current revision.
 
 A tool writes its output through `tinymcp_sink_putc()`, so a shell whose
 output function takes a character can be pointed at the reply directly.
-Output past the out buffer is cut, marked `[cut]`, and the result carries
-`isError`.
+Without `send_part` in the table, output past the out buffer is cut,
+marked `[cut]`, and the result carries `isError`.  With it, a resource's
+text, a tool's content and a kept call's result go out in pieces as they
+are written, the out buffer holding one piece; a reply that fits still
+goes whole through `send`.  Once a piece has gone the reply is committed:
+a host that fails after it ends it short, a tool's with `isError`.
+
+Before writing anything, a resource read or a tool can call
+`tinymcp_sink_binary()` with a MIME type: the bytes that follow go out as
+base64, a `blob` for a resource, `image` or `audio` content for a tool.
+A tool with an `output_schema` returns its typed result through
+`tinymcp_structured()`, which becomes `structuredContent` beside the
+text.
 
 ## The protocol it serves
 
@@ -136,7 +147,8 @@ served statelessly as the 2026-07-28 revision asks, with
 `-32022`; `initialize` switches the stream to the handshake era for the
 requests that follow.  `input_required` is served to a client of the
 current revision; the handshake era's direct `elicitation/create` is not.
-Text content only; no sampling, no HTTP.  A host
+Text, blob, image and audio content and structured results; no
+sampling, no HTTP.  A host
 with an HTTP server wraps `tinymcp_message()`.
 
 ## The bridge
@@ -193,7 +205,10 @@ on first use.  Each era of the conformance run lists, calls, reads, pages,
 subscribes and sees a change arrive from the example server, gets a
 prompt, completes a file name, hears the prompts change, removes a file
 only after its elicitation callback says yes, and follows the example's
-`count` tool: its progress, an echo answered while it counts, a cancel.
+`count` tool: its progress, an echo answered while it counts, a cancel;
+it reads a 108 KB file and a 108 KB tool result whole through a 32 KB out
+buffer, a binary file as a blob, an image from a tool and a structured
+result checked against its output schema.
 
 ## Licence
 

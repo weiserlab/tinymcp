@@ -1,15 +1,13 @@
 /*
- * tinymcp v0.5
+ * tinymcp v0.6
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
  * Authors: Ambuj Varshney <ambuj@tiku-os.org>
  *
- * tinymcp.c - one message in, one reply out.  A request carrying
- * _meta.protocolVersion is served statelessly; initialize switches the
- * stream to the handshake era; subscriptions live in the instance's slots;
- * a tool call the host keeps open is answered later.  Tools, resources,
- * prompts and completion are the host's, through its table.
+ * tinymcp.c - one message in, one reply out, in either era; content past
+ * the out buffer streams through send_part, and a tool call the host keeps
+ * is answered later.  Tools, resources and prompts are the host's table.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -51,8 +49,28 @@ typedef struct req {
 
 static void emit(tinymcp_t *t, tinymcp_jw_t *w)
 {
+    /* A message begun in pieces ends in one, whatever happened to it. */
+    if (w->sent) {
+        if (t->host->send_part(t->ctx, w->buf, w->len, 1) != 0 || w->full)
+            t->dropped++;
+        return;
+    }
     if (w->full || t->host->send(t->ctx, w->buf, w->len) != 0)
         t->dropped++;
+}
+
+static int send_part(void *ctx, const char *bytes, size_t n, int last)
+{
+    tinymcp_t *t = ctx;
+
+    return t->host->send_part(t->ctx, bytes, n, last);
+}
+
+/* Content past the out buffer goes out in pieces, where the host can. */
+static void stream_content(tinymcp_t *t, tinymcp_jw_t *w)
+{
+    if (t->host->send_part)
+        tinymcp_jw_stream(w, send_part, t);
 }
 
 static void write_id(tinymcp_jw_t *w, const tinymcp_jv_t *id)
@@ -131,7 +149,7 @@ static void error_reply(req_t *r, long code, const char *message);
 static void end_result(req_t *r)
 {
     tinymcp_jw_raw(&r->w, "}}");
-    if (r->w.full) {
+    if (r->w.full && !r->w.sent) {
         error_reply(r, -32603, "reply does not fit the out buffer");
         return;
     }
@@ -568,6 +586,10 @@ static void do_tools_list(req_t *r)
         }
         tinymcp_jw_key(w, "inputSchema");
         tinymcp_jw_raw(w, tool->input_schema);
+        if (tool->output_schema) {
+            tinymcp_jw_key(w, "outputSchema");
+            tinymcp_jw_raw(w, tool->output_schema);
+        }
         tinymcp_jw_raw(w, "}");
         if (w->full || w->len > limit) {
             tinymcp_jw_reset(w, mark);
@@ -850,16 +872,24 @@ static void do_resources_read(req_t *r)
     tinymcp_jw_key(w, "contents");
     tinymcp_jw_raw(w, "[{\"uri\":");
     tinymcp_jw_str(w, uri);
-    tinymcp_jw_raw(w, ",\"mimeType\":\"text/plain\",\"text\":\"");
     tinymcp_sink_init(&sink, w, r->t->out_cap - TAIL_RESERVE);
+    tinymcp_sink_lazy(&sink, TINYMCP_SINK_RESOURCE);
+    stream_content(r->t, w);
     split_query(uri, &line, &bytes);
     rc = h->resource_read(r->t->ctx, uri, line, bytes, &sink);
-    if (rc == TINYMCP_NEED_INPUT) {
+    /* Once a piece is out the reply is committed: it ends, short. */
+    if (w->sent && rc < 0)
+        r->t->errors++;
+    else if (rc == TINYMCP_NEED_INPUT) {
         input_required(r);
         return;
-    }
-    if (host_failed(r, rc, "the host could not read"))
+    } else if (host_failed(r, rc, "the host could not read"))
         return;
+    tinymcp_sink_end(&sink);
+    if (sink.cut && sink.b64) {
+        error_reply(r, -32603, "the resource does not fit the out buffer");
+        return;
+    }
     if (sink.cut)
         tinymcp_jw_raw(w, "\\n[cut]");
     tinymcp_jw_raw(w, "\"}]");
@@ -949,6 +979,33 @@ static int name_and_args(req_t *r, const char **name, tinymcp_args_t *args)
     return 0;
 }
 
+/*
+ * The content array's end, isError and structuredContent; mark is where
+ * the array's first item begins.  Binary content that was cut is replaced
+ * by a text saying so.
+ */
+static void end_content(tinymcp_t *t, tinymcp_jw_t *w, tinymcp_sink_t *sink,
+                        size_t mark, int is_error)
+{
+    tinymcp_sink_end(sink);
+    if (sink->cut && sink->b64) {
+        tinymcp_jw_reset(w, mark);
+        tinymcp_jw_raw(w, "{\"type\":\"text\",\"text\":\"the content does "
+                          "not fit the out buffer");
+    } else if (sink->cut) {
+        tinymcp_jw_raw(w, "\\n[cut]");
+    }
+    tinymcp_jw_raw(w, "\"}]");
+    if (is_error || sink->cut) {
+        tinymcp_jw_key(w, "isError");
+        tinymcp_jw_raw(w, "true");
+    }
+    if (t->structured) {
+        tinymcp_jw_key(w, "structuredContent");
+        tinymcp_jw_raw(w, t->structured);
+    }
+}
+
 static void do_tools_call(req_t *r)
 {
     tinymcp_jw_t *w = &r->w;
@@ -956,6 +1013,7 @@ static void do_tools_call(req_t *r)
     tinymcp_args_t args;
     tinymcp_sink_t sink;
     const char *name;
+    size_t mark;
     unsigned i;
     int rc, found = 0;
 
@@ -970,8 +1028,11 @@ static void do_tools_call(req_t *r)
     }
     begin_result(r);
     tinymcp_jw_key(w, "content");
-    tinymcp_jw_raw(w, "[{\"type\":\"text\",\"text\":\"");
+    tinymcp_jw_raw(w, "[");
+    mark = w->len;
     tinymcp_sink_init(&sink, w, r->t->out_cap - TAIL_RESERVE);
+    tinymcp_sink_lazy(&sink, TINYMCP_SINK_TOOL);
+    stream_content(r->t, w);
     r->t->in_call = 1;
     rc = h->tool_call(r->t->ctx, name, &args, &sink);
     r->t->in_call = 0;
@@ -983,19 +1044,19 @@ static void do_tools_call(req_t *r)
     /* Kept and answered now after all: the call is not open. */
     if (r->t->deferred)
         memset(&r->t->later[r->t->deferred - 1], 0, sizeof r->t->later[0]);
+    /* Once a piece is out the reply is committed: a failure is isError. */
+    if (w->sent && rc != TINYMCP_OK) {
+        if (rc != TINYMCP_TOOL_ERROR)
+            r->t->errors++;
+        rc = TINYMCP_TOOL_ERROR;
+    }
     if (rc == TINYMCP_NEED_INPUT) {
         input_required(r);
         return;
     }
     if (rc != TINYMCP_TOOL_ERROR && host_failed(r, rc, "the tool failed"))
         return;
-    if (sink.cut)
-        tinymcp_jw_raw(w, "\\n[cut]");
-    tinymcp_jw_raw(w, "\"}]");
-    if (rc == TINYMCP_TOOL_ERROR || sink.cut) {
-        tinymcp_jw_key(w, "isError");
-        tinymcp_jw_raw(w, "true");
-    }
+    end_content(r->t, w, &sink, mark, rc == TINYMCP_TOOL_ERROR);
     end_result(r);
 }
 
@@ -1425,6 +1486,7 @@ static void process(tinymcp_t *t, char *msg, size_t len)
     t->cur_token.type = TINYMCP_J_NONE;
     t->cur_modern = 0;
     t->deferred = 0;
+    t->structured = NULL;
     k = tinymcp_json_value(msg, len, &root);
     if (!k || root.type != TINYMCP_J_OBJECT) {
         error_reply(&r, -32700, "parse error");
@@ -1511,6 +1573,7 @@ static void process(tinymcp_t *t, char *msg, size_t len)
     t->cur_modern = (unsigned char)r.modern;
     dispatch(&r);
 out:
+    t->structured = NULL;
     t->cur_id.type = TINYMCP_J_NONE;
     t->cur_token.type = TINYMCP_J_NONE;
     t->deferred = 0;
@@ -1877,6 +1940,11 @@ int tinymcp_render(tinymcp_sink_t *sink, const char *text, size_t len,
 
 /* Answering later */
 
+void tinymcp_structured(tinymcp_t *t, const char *json)
+{
+    t->structured = json;
+}
+
 unsigned tinymcp_defer(tinymcp_t *t)
 {
     tinymcp_later_t *l;
@@ -1955,28 +2023,25 @@ int tinymcp_result_begin(tinymcp_t *t, unsigned call, tinymcp_sink_t *text)
     tinymcp_jw_raw(w, ",\"result\":{");
     result_head(t, w, l->modern, 0);
     tinymcp_jw_key(w, "content");
-    tinymcp_jw_raw(w, "[{\"type\":\"text\",\"text\":\"");
+    tinymcp_jw_raw(w, "[");
+    t->later_mark = w->len;
     tinymcp_sink_init(text, w, t->out_cap - TAIL_RESERVE);
+    tinymcp_sink_lazy(text, TINYMCP_SINK_TOOL);
+    stream_content(t, w);
     return 0;
 }
 
-void tinymcp_result_end(tinymcp_t *t, unsigned call,
-                        const tinymcp_sink_t *text, int is_error)
+void tinymcp_result_end(tinymcp_t *t, unsigned call, tinymcp_sink_t *text,
+                        int is_error)
 {
     tinymcp_later_t *l = later_of(t, call);
     tinymcp_jw_t *w = &t->later_w;
 
     if (!l || t->later_open != call)
         return;
-    if (text->cut)
-        tinymcp_jw_raw(w, "\\n[cut]");
-    tinymcp_jw_raw(w, "\"}]");
-    if (is_error || text->cut) {
-        tinymcp_jw_key(w, "isError");
-        tinymcp_jw_raw(w, "true");
-    }
+    end_content(t, w, text, t->later_mark, is_error);
     tinymcp_jw_raw(w, "}}");
-    if (w->full) {
+    if (w->full && !w->sent) {
         tinymcp_jw_reset(w, 0);
         tinymcp_jw_raw(w, "{\"jsonrpc\":\"2.0\",\"id\":");
         tinymcp_jw_raw(w, l->id);
@@ -1986,6 +2051,7 @@ void tinymcp_result_end(tinymcp_t *t, unsigned call,
     }
     emit(t, w);
     later_drop(t, call - 1, 0);
+    t->structured = NULL;
     t->later_open = 0;
     t->busy = 0;
     flush_pending(t);

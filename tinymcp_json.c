@@ -1,5 +1,5 @@
 /*
- * tinymcp v0.5
+ * tinymcp v0.6
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
@@ -362,17 +362,42 @@ void tinymcp_jw_init(tinymcp_jw_t *w, char *buf, size_t cap)
     w->cap = cap;
     w->len = 0;
     w->full = 0;
+    w->flush = NULL;
+    w->ctx = NULL;
+    w->sent = 0;
     if (cap)
         buf[0] = 0;
+}
+
+void tinymcp_jw_stream(tinymcp_jw_t *w, tinymcp_flush_fn flush, void *ctx)
+{
+    if (w->cap < 2)
+        return;
+    w->flush = flush;
+    w->ctx = ctx;
 }
 
 void tinymcp_jw_rawn(tinymcp_jw_t *w, const char *s, size_t n)
 {
     if (w->full)
         return;
-    if (w->len + n >= w->cap) {
-        w->full = 1;
-        return;
+    while (w->len + n >= w->cap) {
+        size_t room = w->cap - 1 - w->len;
+
+        if (!w->flush) {
+            w->full = 1;
+            return;
+        }
+        memcpy(w->buf + w->len, s, room);
+        w->len += room;
+        s += room;
+        n -= room;
+        if (w->flush(w->ctx, w->buf, w->len, 0) != 0) {
+            w->full = 1;
+            return;
+        }
+        w->sent += w->len;
+        w->len = 0;
     }
     memcpy(w->buf + w->len, s, n);
     w->len += n;
@@ -514,6 +539,89 @@ void tinymcp_sink_init(tinymcp_sink_t *s, tinymcp_jw_t *w, size_t limit)
     s->w = w;
     s->limit = limit;
     s->cut = 0;
+    s->kind = TINYMCP_SINK_OPEN;
+    s->opened = 1;
+    s->b64 = 0;
+    s->held = 0;
+}
+
+void tinymcp_sink_lazy(tinymcp_sink_t *s, unsigned kind)
+{
+    s->kind = (unsigned char)kind;
+    s->opened = 0;
+}
+
+/* Room for k more bytes: always on a writer that flushes. */
+static int sink_room(tinymcp_sink_t *s, size_t k)
+{
+    if (s->w->flush)
+        return 1;
+    return s->w->len + k <= s->limit && s->w->len + k < s->w->cap;
+}
+
+/* The text content's opening, at the first byte of text. */
+static void sink_open(tinymcp_sink_t *s)
+{
+    if (s->opened)
+        return;
+    s->opened = 1;
+    if (s->kind == TINYMCP_SINK_RESOURCE)
+        tinymcp_jw_raw(s->w, ",\"mimeType\":\"text/plain\",\"text\":\"");
+    else
+        tinymcp_jw_raw(s->w, "{\"type\":\"text\",\"text\":\"");
+}
+
+int tinymcp_sink_binary(tinymcp_sink_t *s, const char *mime)
+{
+    const char *type = NULL;
+
+    if (s->opened || s->kind == TINYMCP_SINK_OPEN)
+        return -1;
+    if (s->kind == TINYMCP_SINK_TOOL) {
+        if (!strncmp(mime, "image/", 6))
+            type = "image";
+        else if (!strncmp(mime, "audio/", 6))
+            type = "audio";
+        else
+            return -1;
+        tinymcp_jw_raw(s->w, "{\"type\":\"");
+        tinymcp_jw_raw(s->w, type);
+        tinymcp_jw_raw(s->w, "\",\"mimeType\":");
+        tinymcp_jw_str(s->w, mime);
+        tinymcp_jw_raw(s->w, ",\"data\":\"");
+    } else {
+        tinymcp_jw_raw(s->w, ",\"mimeType\":");
+        tinymcp_jw_str(s->w, mime);
+        tinymcp_jw_raw(s->w, ",\"blob\":\"");
+    }
+    s->opened = 1;
+    s->b64 = 1;
+    return 0;
+}
+
+/* The held bytes as one base64 group, padded when fewer than 3. */
+static void b64_group(tinymcp_sink_t *s)
+{
+    static const char a[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+                            "0123456789+/";
+    unsigned char *h = s->hold;
+    char g[4];
+
+    if (!s->held)
+        return;
+    if (s->held < 3)
+        memset(h + s->held, 0, 3u - s->held);
+    if (!sink_room(s, 4)) {
+        s->cut = 1;
+        s->held = 0;
+        return;
+    }
+    g[0] = a[h[0] >> 2];
+    g[1] = a[((h[0] & 3) << 4) | (h[1] >> 4)];
+    g[2] = s->held > 1 ? a[((h[1] & 15) << 2) | (h[2] >> 6)] : '=';
+    g[3] = s->held > 2 ? a[h[2] & 63] : '=';
+    tinymcp_jw_rawn(s->w, g, 4);
+    s->held = 0;
 }
 
 void tinymcp_sink_putc(tinymcp_sink_t *s, char c)
@@ -523,12 +631,26 @@ void tinymcp_sink_putc(tinymcp_sink_t *s, char c)
 
     if (s->cut)
         return;
+    if (s->b64) {
+        s->hold[s->held++] = (unsigned char)c;
+        if (s->held == 3)
+            b64_group(s);
+        return;
+    }
+    sink_open(s);
     k = escaped(c, e);
-    if (s->w->len + k > s->limit || s->w->len + k >= s->w->cap) {
+    if (!sink_room(s, k)) {
         s->cut = 1;
         return;
     }
     tinymcp_jw_rawn(s->w, e, k);
+}
+
+void tinymcp_sink_end(tinymcp_sink_t *s)
+{
+    sink_open(s);
+    if (s->b64 && !s->cut)
+        b64_group(s);
 }
 
 int tinymcp_sink_write(tinymcp_sink_t *s, const char *text, size_t n)

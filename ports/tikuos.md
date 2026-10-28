@@ -16,12 +16,13 @@ what the binding maps, so another host can take the same shape.
 | `templates` | `tiku:///{+path}` and `tiku:///{+path}{?line,bytes}` |
 | `resource_list` | `/sys/vfs/manifest` paged by line, `/data` files from `tiku_vfs_list` |
 | `resource_read` | `tiku_vfs_read_policy`, so a node whose read acts is `TINYMCP_EEFFECT` |
-| `tool_call` | the VFS for `read`/`write`/`ls`; the shell parser with its output captured through `tinymcp_sink_putc` for `shell`; the BASIC job API for `basic`, a call kept with `tinymcp_defer` |
+| `tool_call` | the VFS for `read`/`write`/`ls`, a typed node's value as `structuredContent {value, unit}` decoded from the text read; the shell parser with its output captured through `tinymcp_sink_putc` for `shell`; the BASIC job API for `basic`, a call kept with `tinymcp_defer` |
 | `watch`, `unwatch` | `tiku_vfs_watch` into the tinymcp process; `TIKU_EVENT_VFS` becomes `tinymcp_updated(slot)` |
 | `prompt_list`, `prompt_get` | `/data/prompt.<name>` files: the first line describes, `{{argument}}` places are the arguments, `tinymcp_render` fills them |
 | `complete` | a `path` argument against the namespace, through `tiku_vfs_list` |
 | `cancel` | stops the job of the cancelled `basic` call |
 | `send` | one console frame on channel `0xF3`, or `tcp_send` from the pump |
+| `send_part` | one console frame begun at the first piece and ended at the last, the watchdog kicked at each |
 
 ## The board asks
 
