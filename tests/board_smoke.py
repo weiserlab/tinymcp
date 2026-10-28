@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# tinymcp v0.3
+# tinymcp v0.4
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
@@ -9,12 +9,14 @@
 # board_smoke.py - the official mcp SDK client against a tikuOS board
 # through the bridge: discover, list, read a node, write the LED, subscribe
 # and see the change, run a shell line, get a prompt the board holds,
-# complete a path, and hear the board ask and answer it.  Both eras.  Every check prints one
+# complete a path, hear the board ask and answer it, and ask the owner
+# before a reboot or a clock change, through a form or a token.  Both eras.  Every check prints one
 # "CHECK <era> <key> ok|fail <detail>" line, which TikuBench's suite reads.
 #
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import re
 import sys
 
 import anyio
@@ -31,7 +33,8 @@ KEYS = ["protocol", "identity", "tools", "read", "read-tool", "list",
         "write-missing", "read-missing", "subscribe", "update", "status",
         "prompts", "prompt-get", "prompt-missing", "prompts-changed",
         "complete", "complete-root", "ask-heard", "answer", "answer-stale",
-        "journal"]
+        "journal", "consent-no", "consent-yes", "consent-hidden",
+        "consent-journal"]
 CLIENT = "board-smoke"
 
 PROMPT = "/data/prompt.smoke"
@@ -70,6 +73,7 @@ async def run(mode, port):
     params = StdioServerParameters(command=sys.executable, args=[BRIDGE, port])
     async with Client(params, mode=mode, message_handler=handler,
                       read_timeout_seconds=20, cache=None,
+                      elicitation_callback=on_elicit,
                       client_info=types.Implementation(name=CLIENT, version="1")) as c:
         want = "2025-11-25" if mode == "legacy" else "2026-07-28"
         expect("protocol", c.protocol_version == want, f"protocol {c.protocol_version}")
@@ -139,6 +143,7 @@ async def run(mode, port):
         await prompts(c, mode, seen)
         await completion(c)
         await asks(c, mode, seen)
+        await consent(c, mode)
         r = await c.call_tool("shell", {"line": "mcp"})
         status = text_of(r).strip().replace("\n", " | ")
         expect("status", "tinymcp" in status and "requests" in status, status)
@@ -178,6 +183,72 @@ async def prompts(c, mode, seen):
                 ev = None
             expect("prompts-changed", sub.honored.prompts_list_changed is True and
                    isinstance(ev, PromptsListChanged), f"event {ev}")
+
+
+ANSWER = {"action": "decline", "asked": None}
+
+
+async def on_elicit(context, params):
+    """The owner, as the test plays them: ANSWER["action"] to every form."""
+    ANSWER["asked"] = params.message
+    if ANSWER["action"] == "accept":
+        return types.ElicitResult(action="accept", content={"confirm": True})
+    return types.ElicitResult(action=ANSWER["action"])
+
+
+async def uptime(c):
+    return int((await c.read_resource("tiku:///sys/uptime")).contents[0].text.strip())
+
+
+def token_of(text):
+    m = re.search(r"write (\d+) to /sys/mcp/consent", text)
+    return m.group(1) if m else None
+
+
+async def consent(c, mode):
+    """A reboot refused, a clock target allowed, a job that would reboot."""
+    legacy = mode == "legacy"
+    before = await uptime(c)
+    ANSWER.update(action="decline", asked=None)
+    try:
+        r = await c.call_tool("shell", {"line": "reboot"})
+    except MCPError as e:
+        expect("consent-no", False, f"the board did not answer, so it rebooted: {e}")
+        return
+    await anyio.sleep(1.5)
+    after = await uptime(c)
+    if legacy:
+        ok = r.is_error and token_of(text_of(r)) and ANSWER["asked"] is None
+    else:
+        ok = r.is_error and ANSWER["asked"] == f"{CLIENT} asks to reboot the board.  Allow it?"
+    expect("consent-no", ok and after >= before,
+           f"{text_of(r)[:70]!r}; uptime {before} -> {after}")
+
+    target = (await c.read_resource("tiku:///sys/cpu/freq_target")).contents[0].text.strip()
+    ANSWER.update(action="accept", asked=None)
+    r = await c.call_tool("write", {"path": "/sys/cpu/freq_target", "value": target})
+    detail = text_of(r)[:60]
+    if legacy:
+        token = token_of(text_of(r))
+        bad = await c.call_tool("write", {"path": "/sys/mcp/consent", "value": "1"})
+        good = await c.call_tool("write", {"path": "/sys/mcp/consent", "value": token or "0"})
+        r = await c.call_tool("write", {"path": "/sys/cpu/freq_target", "value": target})
+        ok = token and bad.is_error and not good.is_error and not r.is_error
+        detail = f"token {token}; wrong {text_of(bad)!r}; again {text_of(r)!r}"
+    else:
+        ok = not r.is_error and "change the CPU clock" in (ANSWER["asked"] or "")
+    expect("consent-yes", ok, f"target {target}: {detail}")
+
+    ANSWER.update(action="decline", asked=None)
+    r = await c.call_tool("shell", {"line": "once 300 reboot"})
+    jobs = text_of(await c.call_tool("shell", {"line": "jobs"}))
+    expect("consent-hidden", r.is_error and "reboot" not in jobs,
+           f"{text_of(r)[:50]!r}; jobs {jobs.strip()!r}")
+
+    j = (await c.read_resource("tiku:///sys/mcp/journal")).contents[0].text
+    expect("consent-journal", f"{CLIENT} allowed: change the CPU clock" in j and
+           f"{CLIENT} asked consent: reboot the board" in j,
+           " | ".join(j.splitlines()[-4:]))
 
 
 QUESTION = "tiku:///sys/mcp/ask/question"

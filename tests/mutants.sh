@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# tinymcp v0.3
+# tinymcp v0.4
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
@@ -83,6 +83,15 @@ mutate client-per-request tinymcp.c 's/            t->client\[0\] = 0;$/        
 mutate client-legacy tinymcp.c 's/    if (param(r, "clientInfo", \&v))/    if (0)/'
 mutate client-cut tinymcp.c 's/        if (tinymcp_json_decode(t->client, n) >= 0)/        if (1)/'
 mutate client-closed tinymcp.c '/    t->legacy_version = NULL;/{n;s/    t->client\[0\] = 0;/    ;/;}'
+
+mutate input-required-type tinymcp.c 's/{\\"resultType\\":\\"input_required\\",/{\\"resultType\\":\\"complete\\",/'
+mutate elicits-always tinymcp.c 's/            t->elicits = tinymcp_json_get(\&v, "elicitation", \&el) == 1 \&\&/            t->elicits = 1 || (tinymcp_json_get(\&v, "elicitation", \&el) == 1) ||/'
+mutate input-not-reset tinymcp.c '/^out:$/,/flush_pending/{s/    t->in_responses.type = TINYMCP_J_NONE;/    ;/;}'
+mutate elicit-not-reset tinymcp.c '/^out:$/,/flush_pending/{s/    t->el_key = t->el_message = t->el_schema = t->el_state = NULL;/    ;/;}'
+mutate state-no-decode tinymcp.c 's/    return tinymcp_json_decode(buf, t->in_state.len);/    buf[t->in_state.len] = 0; return (int)t->in_state.len;/'
+mutate decline-is-accept tinymcp.c 's/    if (tinymcp_json_is(\&action, "decline"))/    if (tinymcp_json_is(\&action, "accept"))/'
+mutate state-fits tinymcp.c 's/    if (t->in_state.type != TINYMCP_J_STRING || t->in_state.len + 1 > cap)/    if (t->in_state.type != TINYMCP_J_STRING || t->in_state.len > cap)/'
+mutate need-input-tool tinymcp.c '/rc = h->tool_call/,/host_failed/{s/    if (rc == TINYMCP_NEED_INPUT) {/    if (0) {/;}'
 
 echo "$total mutants, $survived survived"
 [ "$survived" -eq 0 ]

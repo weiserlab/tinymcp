@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# tinymcp v0.3
+# tinymcp v0.4
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
@@ -74,7 +74,7 @@ async def common(c, mode, dirpath):
 
     tools = await c.list_tools()
     names = sorted(t.name for t in tools.tools)
-    expect(names == ["echo", "shell", "whoami", "write"], f"tool names {names}")
+    expect(names == ["echo", "remove", "shell", "whoami", "write"], f"tool names {names}")
     r = await c.call_tool("whoami", {})
     expect(text_of(r) == "conformance", f"the client's name {text_of(r)!r}")
     echo = next(t for t in tools.tools if t.name == "echo")
@@ -130,10 +130,43 @@ async def common(c, mode, dirpath):
         expect(e.error.code in (-32002, -32602), "path outside the directory refused")
 
     await prompts_and_completion(c)
+    await consent(c, legacy, dirpath)
 
     if legacy:
         await c.send_ping()
         expect(True, "ping answered")
+
+
+ANSWER = {"action": "accept"}
+
+
+async def on_elicit(context, params):
+    """The person, as the test plays them: ANSWER["action"] to every form."""
+    ANSWER["asked"] = params.message
+    if ANSWER["action"] == "accept":
+        return types.ElicitResult(action="accept", content={"confirm": True})
+    return types.ElicitResult(action=ANSWER["action"])
+
+
+async def consent(c, legacy, dirpath):
+    for n in ("doomed.txt", "kept.txt"):
+        with open(os.path.join(dirpath, n), "w") as f:
+            f.write("x")
+    ANSWER.update(action="decline", asked=None)
+    r = await c.call_tool("remove", {"name": "kept.txt"})
+    kept = os.path.exists(os.path.join(dirpath, "kept.txt"))
+    if legacy:
+        expect(r.is_error and "cannot ask" in text_of(r) and ANSWER["asked"] is None
+               and kept, f"the handshake era is refused: {text_of(r)!r}")
+        return
+    expect(ANSWER["asked"] == "Delete kept.txt?" and r.is_error and kept,
+           f"a no keeps the file: asked {ANSWER['asked']!r}, {text_of(r)!r}")
+    ANSWER.update(action="accept", asked=None)
+    r = await c.call_tool("remove", {"name": "doomed.txt"})
+    expect(ANSWER["asked"] == "Delete doomed.txt?" and not r.is_error and
+           not os.path.exists(os.path.join(dirpath, "doomed.txt")),
+           f"a yes deletes it: {text_of(r)!r}")
+    os.remove(os.path.join(dirpath, "kept.txt"))
 
 
 async def prompts_and_completion(c):
@@ -248,6 +281,7 @@ async def run(mode, exe):
         params = StdioServerParameters(command=exe, args=["--dir", dirpath])
         async with Client(params, mode=mode, message_handler=handler,
                           read_timeout_seconds=10, cache=None,
+                          elicitation_callback=on_elicit,
                           client_info=types.Implementation(name="conformance",
                                                            version="1")) as c:
             want = "2025-11-25" if mode == "legacy" else "2026-07-28"

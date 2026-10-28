@@ -30,6 +30,13 @@ a leading `#<seq> ` names the question it answers, and an answer to an
 older one is refused), `seq`, `state` (`idle`, `asked`, `answered`),
 `asked_by` and `answered_by`.  A writer is the client's name from
 `tinymcp_client()` while one of its tools runs, `board` otherwise.
+Before an agent reboots the board, changes its sleep mode, powers a part
+down, changes the CPU clock or the memory layout, through the `write` or
+the `shell` tool or a job or rule that would, the binding asks the owner:
+a client that can elicit gets an `input_required` form, any other a token
+in the error, which it writes to `/sys/mcp/consent` before it makes the
+same call again within 60 s.
+
 `/sys/mcp/journal` is a RAM ring of the last 16 entries, `<seconds> <who>
 <what>`: questions, answers, the `write` and `shell` tools, and whatever a
 client writes there.

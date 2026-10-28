@@ -1,5 +1,5 @@
 /*
- * tinymcp v0.3
+ * tinymcp v0.4
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
@@ -24,7 +24,7 @@
 extern "C" {
 #endif
 
-#define TINYMCP_VERSION  "0.3.0"
+#define TINYMCP_VERSION  "0.4.0"
 #define TINYMCP_API      2             /* bumped on any change to tinymcp_host_t */
 #define TINYMCP_PROTOCOL "2026-07-28"  /* the newest revision served */
 
@@ -48,6 +48,8 @@ extern "C" {
 /* What a host function returns. */
 #define TINYMCP_OK          0
 #define TINYMCP_TOOL_ERROR  1     /* tool_call: the text is the error, isError true */
+#define TINYMCP_NEED_INPUT  2     /* tool_call, resource_read, prompt_get: send the
+                                     elicitation tinymcp_elicit() set instead */
 #define TINYMCP_ENOENT    (-1)    /* no such resource */
 #define TINYMCP_EEFFECT   (-2)    /* reading would act; the client is told to use a tool */
 #define TINYMCP_EINVAL    (-3)    /* an argument is missing or wrong */
@@ -254,6 +256,13 @@ typedef struct tinymcp {
     tinymcp_era_t era;
     const char *legacy_version; /* the version initialize settled on */
     char client[TINYMCP_CLIENT_MAX]; /* the requesting client's name, or "" */
+    unsigned char elicits;      /* this request's client can be asked (input_required) */
+    tinymcp_jv_t in_responses;  /* this request's inputResponses, or J_NONE */
+    tinymcp_jv_t in_state;      /* this request's requestState, or J_NONE */
+    const char *el_key;         /* the elicitation a host asked for, until it returns */
+    const char *el_message;
+    const char *el_schema;
+    const char *el_state;
     unsigned char busy;         /* inside a request: notifications wait */
     unsigned pending;           /* slots whose update waits, one bit each */
     unsigned char pending_lc;   /* TINYMCP_LC_* notices that wait */
@@ -312,6 +321,43 @@ const char *tinymcp_era_name(const tinymcp_t *t);
  * era, the request's _meta for the current revision; "" when it gave none.
  */
 const char *tinymcp_client(const tinymcp_t *t);
+
+/*
+ * Asking the person: a host function that needs a yes before it acts calls
+ * tinymcp_elicit() and returns TINYMCP_NEED_INPUT; the client shows the form
+ * and sends the request again, with the answers and the state, which the
+ * host reads through the tinymcp_input_* calls while it runs.
+ */
+
+/** True when the request being served can carry input_required: the
+ *  2026-07-28 revision, from a client that declared elicitation. */
+int tinymcp_client_elicits(const tinymcp_t *t);
+
+/**
+ * Describe the form the client must show: key names it in inputRequests,
+ * schema is a flat JSON Schema object as text, state comes back verbatim
+ * as requestState (NULL for none).  The strings must outlive the host call.
+ * @return 0, or -1 when the request cannot carry input_required.
+ */
+int tinymcp_elicit(tinymcp_t *t, const char *key, const char *message,
+                   const char *schema, const char *state);
+
+#define TINYMCP_INPUT_NONE    0   /* no response under that key */
+#define TINYMCP_INPUT_ACCEPT  1
+#define TINYMCP_INPUT_DECLINE 2
+#define TINYMCP_INPUT_CANCEL  3
+
+/** The action of the response under key in this request's inputResponses. */
+int tinymcp_input_action(const tinymcp_t *t, const char *key);
+
+/** A boolean field of that response's content: 1, 0, or -1 when absent. */
+int tinymcp_input_bool(const tinymcp_t *t, const char *key, const char *field);
+
+/**
+ * This request's requestState, decoded into buf.
+ * @return its length, or -1 when it is absent or does not fit cap - 1.
+ */
+int tinymcp_request_state(const tinymcp_t *t, char *buf, size_t cap);
 
 #ifdef __cplusplus
 }

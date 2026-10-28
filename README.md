@@ -28,11 +28,11 @@ ports/                          what each host maps
 hygiene/                        the commit and style checks
 ```
 
-| Measured on 2026-10-26 | |
+| Measured on 2026-10-27 | |
 |---|---|
-| code, `-Os`, Cortex-M33 (`make size`) | 13.7 KB (`tinymcp.c` 11.7 KB, `tinymcp_json.c` 2.1 KB) |
-| code, `-Os`, Cortex-M0+ | 13.7 KB |
-| one instance, `tinymcp_t`, four subscription slots, Cortex-M33 | 648 bytes |
+| code, `-Os`, Cortex-M33 (`make size`) | 14.8 KB (`tinymcp.c` 12.7 KB, `tinymcp_json.c` 2.1 KB) |
+| code, `-Os`, Cortex-M0+ | 14.9 KB |
+| one instance, `tinymcp_t`, four subscription slots, Cortex-M33 | 692 bytes |
 | stack during a tool call | about 1 KB (the argument table) |
 | buffers | the host's: the in buffer holds one request, the out buffer one reply |
 
@@ -86,6 +86,15 @@ calls `tinymcp_prompts_changed()` when the set of prompts changes.
 `tinymcp_complete_add()`; the reply keeps the first 100 that fit and
 reports the rest in `total` and `hasMore`.
 
+A host that needs the person's yes before it acts calls `tinymcp_elicit()`
+with a form and a state and returns `TINYMCP_NEED_INPUT`; the library
+answers with the 2026-07-28 revision's `input_required`, the client shows
+the form and sends the request again, and the host reads the answer with
+`tinymcp_input_action()`, `tinymcp_input_bool()` and
+`tinymcp_request_state()`.  `tinymcp_client_elicits()` says whether the
+request can carry that: a client of the current revision that declared
+elicitation.
+
 `name`, `title` and `version` are the host's `serverInfo`; the library
 names itself in the `org.tinymcp/library` member of the `_meta` of the
 discover and initialize results.  `tinymcp_client()` is the name the
@@ -113,7 +122,9 @@ A request that carries `_meta.io.modelcontextprotocol/protocolVersion` is
 served statelessly as the 2026-07-28 revision asks, with
 `clientCapabilities` required and an unsupported version answered by
 `-32022`; `initialize` switches the stream to the handshake era for the
-requests that follow.  Text content only; no sampling, no HTTP.  A host
+requests that follow.  `input_required` is served to a client of the
+current revision; the handshake era's direct `elicitation/create` is not.
+Text content only; no sampling, no HTTP.  A host
 with an HTTP server wraps `tinymcp_message()`.
 
 ## The bridge
@@ -168,7 +179,8 @@ make lint            # comment and prose style over the tracked files
 `make conformance` creates `.venv` with the `mcp` and `pyserial` packages
 on first use.  Each era of the conformance run lists, calls, reads, pages,
 subscribes and sees a change arrive from the example server, gets a
-prompt, completes a file name, and hears the prompts change.
+prompt, completes a file name, hears the prompts change, and removes a
+file only after its elicitation callback says yes.
 
 ## Licence
 

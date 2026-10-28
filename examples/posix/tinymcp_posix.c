@@ -1,5 +1,5 @@
 /*
- * tinymcp v0.3
+ * tinymcp v0.4
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
@@ -160,7 +160,52 @@ static const tinymcp_tool_t tools[] = {
       "\"required\":[\"text\"]}" },
     { "whoami", "Return the name the client gave in its clientInfo.",
       "{\"type\":\"object\"}" },
+    { "remove", "Delete a file of the served directory, after the person "
+      "says yes.",
+      "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},"
+      "\"required\":[\"name\"]}" },
 };
+
+#define CONFIRM_SCHEMA "{\"type\":\"object\",\"properties\":{\"confirm\":" \
+    "{\"type\":\"boolean\",\"title\":\"Delete it\"}},\"required\":[\"confirm\"]}"
+
+/* remove: asks through input_required, the file's name as the state, and
+ * deletes on the retry that carries a yes for that same name. */
+static int remove_file(const char *fname, tinymcp_sink_t *text)
+{
+    static char message[NAME_MAX_LEN + 32], state[NAME_MAX_LEN + 8];
+    char back[NAME_MAX_LEN + 8], path[512];
+    int action = tinymcp_input_action(&server, "confirm");
+
+    if (strchr(fname, '/') || fname[0] == '.' || strlen(fname) >= NAME_MAX_LEN ||
+        path_of(fname, path, sizeof path) || access(path, F_OK)) {
+        tinymcp_sink_puts(text, "no such file");
+        return TINYMCP_TOOL_ERROR;
+    }
+    snprintf(state, sizeof state, "rm:%s", fname);
+    if (action == TINYMCP_INPUT_DECLINE || action == TINYMCP_INPUT_CANCEL) {
+        tinymcp_sink_puts(text, "the person said no; nothing was deleted");
+        return TINYMCP_TOOL_ERROR;
+    }
+    if (action == TINYMCP_INPUT_ACCEPT &&
+        tinymcp_input_bool(&server, "confirm", "confirm") == 1 &&
+        tinymcp_request_state(&server, back, sizeof back) >= 0 &&
+        !strcmp(back, state)) {
+        if (unlink(path)) {
+            tinymcp_sink_puts(text, strerror(errno));
+            return TINYMCP_TOOL_ERROR;
+        }
+        tinymcp_listchanged(&server);
+        return TINYMCP_OK;
+    }
+    snprintf(message, sizeof message, "Delete %s?", fname);
+    if (tinymcp_elicit(&server, "confirm", message, CONFIRM_SCHEMA, state)) {
+        tinymcp_sink_puts(text, "deleting needs the person's yes, and this "
+                                "client cannot ask");
+        return TINYMCP_TOOL_ERROR;
+    }
+    return TINYMCP_NEED_INPUT;
+}
 
 static const tinymcp_template_t templates[] = {
     { "file:///{name}", "a file", "a file of the served directory" },
@@ -279,6 +324,13 @@ static int call(void *ctx, const char *name, const tinymcp_args_t *args,
             return TINYMCP_EINVAL;
         tinymcp_sink_puts(text, s);
         return TINYMCP_OK;
+    }
+    if (!strcmp(name, "remove")) {
+        const char *fname = tinymcp_arg_str(args, "name");
+
+        if (!fname)
+            return TINYMCP_EINVAL;
+        return remove_file(fname, text);
     }
     if (!strcmp(name, "whoami")) {
         tinymcp_sink_puts(text, tinymcp_client(&server));

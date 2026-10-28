@@ -1,5 +1,5 @@
 /*
- * tinymcp v0.3
+ * tinymcp v0.4
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
@@ -788,6 +788,39 @@ static int host_failed(req_t *r, int rc, const char *what)
     return 0;
 }
 
+/* The InputRequiredResult for the elicitation the host described. */
+static void input_required(req_t *r)
+{
+    tinymcp_t *t = r->t;
+    tinymcp_jw_t *w = &r->w;
+
+    if (!t->el_key || !t->el_message || !t->el_schema) {
+        error_reply(r, -32603, "the host asked for input it did not describe");
+        return;
+    }
+    tinymcp_jw_reset(w, 0);
+    tinymcp_jw_raw(w, "{\"jsonrpc\":\"2.0\",\"id\":");
+    write_id(w, &r->id);
+    tinymcp_jw_raw(w, ",\"result\":{\"resultType\":\"input_required\","
+                      "\"_meta\":{\"" META_SRV "\":");
+    server_info(w, t->host);
+    tinymcp_jw_raw(w, "}");
+    tinymcp_jw_key(w, "inputRequests");
+    tinymcp_jw_raw(w, "{");
+    tinymcp_jw_key(w, t->el_key);
+    tinymcp_jw_raw(w, "{\"method\":\"elicitation/create\",\"params\":"
+                      "{\"mode\":\"form\",\"message\":");
+    tinymcp_jw_str(w, t->el_message);
+    tinymcp_jw_raw(w, ",\"requestedSchema\":");
+    tinymcp_jw_raw(w, t->el_schema);
+    tinymcp_jw_raw(w, "}}}");
+    if (t->el_state) {
+        tinymcp_jw_key(w, "requestState");
+        tinymcp_jw_str(w, t->el_state);
+    }
+    end_result(r);
+}
+
 static void do_resources_read(req_t *r)
 {
     tinymcp_jw_t *w = &r->w;
@@ -813,6 +846,10 @@ static void do_resources_read(req_t *r)
     tinymcp_sink_init(&sink, w, r->t->out_cap - TAIL_RESERVE);
     split_query(uri, &line, &bytes);
     rc = h->resource_read(r->t->ctx, uri, line, bytes, &sink);
+    if (rc == TINYMCP_NEED_INPUT) {
+        input_required(r);
+        return;
+    }
     if (host_failed(r, rc, "the host could not read"))
         return;
     if (sink.cut)
@@ -928,6 +965,10 @@ static void do_tools_call(req_t *r)
     tinymcp_jw_raw(w, "[{\"type\":\"text\",\"text\":\"");
     tinymcp_sink_init(&sink, w, r->t->out_cap - TAIL_RESERVE);
     rc = h->tool_call(r->t->ctx, name, &args, &sink);
+    if (rc == TINYMCP_NEED_INPUT) {
+        input_required(r);
+        return;
+    }
     if (rc != TINYMCP_TOOL_ERROR && host_failed(r, rc, "the tool failed"))
         return;
     if (sink.cut)
@@ -956,6 +997,10 @@ static void do_prompts_get(req_t *r)
                       "\"text\":\"");
     tinymcp_sink_init(&sink, w, r->t->out_cap - TAIL_RESERVE);
     rc = r->t->host->prompt_get(r->t->ctx, name, &args, &sink);
+    if (rc == TINYMCP_NEED_INPUT) {
+        input_required(r);
+        return;
+    }
     if (rc == TINYMCP_ENOENT) {
         error_reply(r, -32602, "unknown prompt");
         return;
@@ -1337,6 +1382,10 @@ static void process(tinymcp_t *t, char *msg, size_t len)
     tinymcp_jw_init(&r.w, t->out, t->out_cap);
     t->requests++;
     t->busy = 1;
+    t->elicits = 0;
+    t->in_responses.type = TINYMCP_J_NONE;
+    t->in_state.type = TINYMCP_J_NONE;
+    t->el_key = t->el_message = t->el_schema = t->el_state = NULL;
     k = tinymcp_json_value(msg, len, &root);
     if (!k || root.type != TINYMCP_J_OBJECT) {
         error_reply(&r, -32700, "parse error");
@@ -1396,6 +1445,18 @@ static void process(tinymcp_t *t, char *msg, size_t len)
             goto out;
         }
         r.modern = 1;
+        {
+            tinymcp_jv_t el;
+
+            t->elicits = tinymcp_json_get(&v, "elicitation", &el) == 1 &&
+                         el.type == TINYMCP_J_OBJECT;
+        }
+        /* A retry after input_required carries the answers and the state;
+         * they are read in place, never decoded there. */
+        if (!param(&r, "inputResponses", &t->in_responses))
+            t->in_responses.type = TINYMCP_J_NONE;
+        if (!param(&r, "requestState", &t->in_state))
+            t->in_state.type = TINYMCP_J_NONE;
         /* Each request names its own client in this revision. */
         if (tinymcp_json_get(&meta, META_CLI, &v) == 1)
             keep_client(t, &v);
@@ -1405,6 +1466,10 @@ static void process(tinymcp_t *t, char *msg, size_t len)
     dispatch(&r);
 out:
     t->busy = 0;
+    t->elicits = 0;
+    t->in_responses.type = TINYMCP_J_NONE;
+    t->in_state.type = TINYMCP_J_NONE;
+    t->el_key = t->el_message = t->el_schema = t->el_state = NULL;
     flush_pending(t);
 }
 
@@ -1571,6 +1636,71 @@ const char *tinymcp_era_name(const tinymcp_t *t)
 const char *tinymcp_client(const tinymcp_t *t)
 {
     return t->client;
+}
+
+int tinymcp_client_elicits(const tinymcp_t *t)
+{
+    return t->elicits;
+}
+
+int tinymcp_elicit(tinymcp_t *t, const char *key, const char *message,
+                   const char *schema, const char *state)
+{
+    if (!t->elicits || !key || !message || !schema)
+        return -1;
+    t->el_key = key;
+    t->el_message = message;
+    t->el_schema = schema;
+    t->el_state = state;
+    return 0;
+}
+
+/* The response object under key in this request's inputResponses. */
+static int input_response(const tinymcp_t *t, const char *key, tinymcp_jv_t *out)
+{
+    return t->in_responses.type == TINYMCP_J_OBJECT &&
+           tinymcp_json_get(&t->in_responses, key, out) == 1 &&
+           out->type == TINYMCP_J_OBJECT;
+}
+
+int tinymcp_input_action(const tinymcp_t *t, const char *key)
+{
+    tinymcp_jv_t resp, action;
+
+    if (!input_response(t, key, &resp) ||
+        tinymcp_json_get(&resp, "action", &action) != 1)
+        return TINYMCP_INPUT_NONE;
+    if (tinymcp_json_is(&action, "accept"))
+        return TINYMCP_INPUT_ACCEPT;
+    if (tinymcp_json_is(&action, "decline"))
+        return TINYMCP_INPUT_DECLINE;
+    if (tinymcp_json_is(&action, "cancel"))
+        return TINYMCP_INPUT_CANCEL;
+    return TINYMCP_INPUT_NONE;
+}
+
+int tinymcp_input_bool(const tinymcp_t *t, const char *key, const char *field)
+{
+    tinymcp_jv_t resp, content, v;
+
+    if (!input_response(t, key, &resp) ||
+        tinymcp_json_get(&resp, "content", &content) != 1 ||
+        content.type != TINYMCP_J_OBJECT ||
+        tinymcp_json_get(&content, field, &v) != 1)
+        return -1;
+    if (v.type == TINYMCP_J_TRUE)
+        return 1;
+    if (v.type == TINYMCP_J_FALSE)
+        return 0;
+    return -1;
+}
+
+int tinymcp_request_state(const tinymcp_t *t, char *buf, size_t cap)
+{
+    if (t->in_state.type != TINYMCP_J_STRING || t->in_state.len + 1 > cap)
+        return -1;
+    memcpy(buf, t->in_state.at, t->in_state.len);
+    return tinymcp_json_decode(buf, t->in_state.len);
 }
 
 const char *tinymcp_arg_str(const tinymcp_args_t *args, const char *key)

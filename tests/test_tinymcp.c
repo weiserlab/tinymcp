@@ -1,5 +1,5 @@
 /*
- * tinymcp v0.3
+ * tinymcp v0.4
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
@@ -61,6 +61,8 @@ static int fake_list(void *ctx, unsigned cursor, tinymcp_list_t *list)
     return 0;
 }
 
+static int guarded(tinymcp_sink_t *text);
+
 static int fake_read(void *ctx, const char *uri, unsigned line, unsigned bytes,
                      tinymcp_sink_t *text)
 {
@@ -84,6 +86,8 @@ static int fake_read(void *ctx, const char *uri, unsigned line, unsigned bytes,
     }
     if (!strcmp(uri, "test:///effect"))
         return TINYMCP_EEFFECT;
+    if (!strcmp(uri, "test:///guarded"))
+        return guarded(text);
     if (!strcmp(uri, "test:///long")) {
         int i;
 
@@ -107,6 +111,8 @@ static const tinymcp_tool_t tools[] = {
     { "touch", "notifies slot 0 from inside the call", "{\"type\":\"object\"}" },
     { "flag", "a boolean", "{\"type\":\"object\"}" },
     { "reprompt", "prompts changed, from inside the call", "{\"type\":\"object\"}" },
+    { "guarded", "asks the person first", "{\"type\":\"object\"}" },
+    { "lazy", "needs input it does not describe", "{\"type\":\"object\"}" },
 };
 #define NTOOLS (sizeof tools / sizeof tools[0])
 
@@ -114,6 +120,36 @@ static const tinymcp_template_t templates[] = {
     { "test:///{+path}", "a path", "any path" },
     { "test:///{+path}{?line,bytes}", "a page", NULL },
 };
+
+#define CONFIRM_SCHEMA "{\"type\":\"object\",\"properties\":{\"confirm\":" \
+                       "{\"type\":\"boolean\"}},\"required\":[\"confirm\"]}"
+
+/* A yes through input_required: done after an accepted confirm under the
+ * state "s1", refused after a decline, asked again otherwise. */
+static int guarded(tinymcp_sink_t *text)
+{
+    char state[8];
+    int action = tinymcp_input_action(touch_target, "confirm");
+
+    if (!tinymcp_client_elicits(touch_target)) {
+        tinymcp_sink_puts(text, "cannot ask");
+        return TINYMCP_TOOL_ERROR;
+    }
+    if (action == TINYMCP_INPUT_DECLINE || action == TINYMCP_INPUT_CANCEL) {
+        tinymcp_sink_puts(text, action == TINYMCP_INPUT_DECLINE ? "declined"
+                                                                : "cancelled");
+        return TINYMCP_TOOL_ERROR;
+    }
+    if (action == TINYMCP_INPUT_ACCEPT &&
+        tinymcp_input_bool(touch_target, "confirm", "confirm") == 1 &&
+        tinymcp_request_state(touch_target, state, sizeof state) == 2 &&
+        !strcmp(state, "s1")) {
+        tinymcp_sink_puts(text, "done");
+        return TINYMCP_OK;
+    }
+    tinymcp_elicit(touch_target, "confirm", "Really do it?", CONFIRM_SCHEMA, "s1");
+    return TINYMCP_NEED_INPUT;
+}
 
 static int fake_tool(void *ctx, const char *name, const tinymcp_args_t *args,
                      tinymcp_sink_t *text)
@@ -154,6 +190,10 @@ static int fake_tool(void *ctx, const char *name, const tinymcp_args_t *args,
         tinymcp_sink_puts(text, "touched");
         return TINYMCP_OK;
     }
+    if (!strcmp(name, "guarded"))
+        return guarded(text);
+    if (!strcmp(name, "lazy"))
+        return TINYMCP_NEED_INPUT;
     if (!strcmp(name, "reprompt")) {
         tinymcp_prompts_changed(touch_target);
         tinymcp_sink_puts(text, "reprompted");
@@ -1276,6 +1316,100 @@ static void client_names(void)
     SAME(tinymcp_client(&t), "");
 }
 
+#define META_EL "\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":" \
+    "\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":" \
+    "{\"elicitation\":{\"form\":{}}}}"
+#define GUARDED(id, extra, meta) \
+    "{\"jsonrpc\":\"2.0\",\"id\":" id ",\"method\":\"tools/call\"," \
+    "\"params\":{\"name\":\"guarded\"" extra "," meta "}}"
+#define ACCEPT(v) ",\"inputResponses\":{\"confirm\":{\"action\":\"accept\"," \
+    "\"content\":{\"confirm\":" v "}}}"
+
+static void consent(void)
+{
+    char buf[4];
+
+    reset(&host_full, sizeof out_buf, 4);
+    say(GUARDED("1", "", META_EL));
+    SAME(last(), "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":"
+                 "\"input_required\",\"_meta\":{\"io.modelcontextprotocol/serverInfo\":"
+                 "{\"name\":\"fake\",\"title\":\"The Fake\",\"version\":\"9.9\"}},"
+                 "\"inputRequests\":{\"confirm\":{\"method\":\"elicitation/create\","
+                 "\"params\":{\"mode\":\"form\",\"message\":\"Really do it?\","
+                 "\"requestedSchema\":" CONFIRM_SCHEMA "}}},\"requestState\":\"s1\"}}");
+    /* Between requests nothing points into the message just served. */
+    CHECK(t.el_key == NULL && t.el_state == NULL);
+    /* The retry with a yes and the state does it. */
+    say(GUARDED("2", ACCEPT("true") ",\"requestState\":\"s\\u0031\"", META_EL));
+    CONTAINS(last(), "\"id\":2,\"result\":{\"resultType\":\"complete\"");
+    CONTAINS(last(), "\"text\":\"done\"}]");
+    LACKS(last(), "isError");
+    /* A yes without its state, or with confirm false, is asked again. */
+    say(GUARDED("3", ACCEPT("true"), META_EL));
+    CONTAINS(last(), "\"resultType\":\"input_required\"");
+    say(GUARDED("4", ACCEPT("false") ",\"requestState\":\"s1\"", META_EL));
+    CONTAINS(last(), "\"resultType\":\"input_required\"");
+    say(GUARDED("5", ",\"inputResponses\":{\"confirm\":{\"action\":\"decline\"}},"
+                "\"requestState\":\"s1\"", META_EL));
+    CONTAINS(last(), "\"text\":\"declined\"}],\"isError\":true");
+    CHECK(t.in_responses.type == TINYMCP_J_NONE &&
+          t.in_state.type == TINYMCP_J_NONE &&
+          tinymcp_input_action(&t, "confirm") == TINYMCP_INPUT_NONE);
+    say(GUARDED("6", ",\"inputResponses\":{\"confirm\":{\"action\":\"cancel\"}}",
+                META_EL));
+    CONTAINS(last(), "\"text\":\"cancelled\"}],\"isError\":true");
+    /* The next request carries none of it: no answers, no form. */
+    say(GUARDED("7", "", META));
+    CONTAINS(last(), "\"text\":\"cannot ask\"}],\"isError\":true");
+    CHECK(t.el_key == NULL && t.in_responses.type == TINYMCP_J_NONE &&
+          t.in_state.type == TINYMCP_J_NONE && !t.elicits);
+    CHECK(tinymcp_input_action(&t, "confirm") == TINYMCP_INPUT_NONE);
+    CHECK(tinymcp_input_bool(&t, "confirm", "confirm") == -1);
+    CHECK(tinymcp_request_state(&t, buf, sizeof buf) == -1);
+    /* A read can ask too; a host that asks without a form is an error. */
+    say("{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"resources/read\","
+        "\"params\":{\"uri\":\"test:///guarded\"," META_EL "}}");
+    CONTAINS(last(), "\"id\":8,\"result\":{\"resultType\":\"input_required\"");
+    say("{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"lazy\"," META_EL "}}");
+    CONTAINS(last(), "\"id\":9,\"error\":{\"code\":-32603");
+    /* A state longer than the buffer is refused, not cut. */
+    say("{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"ping\",\"params\":{"
+        "\"requestState\":\"abcd\"," META_EL "}}");
+    CHECK(tinymcp_client_elicits(&t) == 0);
+    /* The handshake era cannot carry input_required. */
+    reset(&host_full, sizeof out_buf, 4);
+    say("{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{"
+        "\"protocolVersion\":\"2025-11-25\",\"capabilities\":{\"elicitation\":{}}}}");
+    say("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"guarded\"}}");
+    CONTAINS(last(), "\"text\":\"cannot ask\"}],\"isError\":true");
+    CHECK(tinymcp_elicit(&t, "k", "m", "{}", NULL) == -1);
+}
+
+/* The accessors on one message, held mid-request. */
+static void consent_accessors(void)
+{
+    char msg[] = "{\"confirm\":{\"action\":\"accept\",\"content\":"
+                 "{\"confirm\":true,\"n\":3}},\"x\":{\"action\":\"maybe\"}}";
+    char state[] = "\"abc\"";
+    char buf[4];
+
+    reset(&host_full, sizeof out_buf, 4);
+    tinymcp_json_value(msg, strlen(msg), &t.in_responses);
+    tinymcp_json_value(state, strlen(state), &t.in_state);
+    CHECK(tinymcp_input_action(&t, "confirm") == TINYMCP_INPUT_ACCEPT);
+    CHECK(tinymcp_input_action(&t, "x") == TINYMCP_INPUT_NONE);
+    CHECK(tinymcp_input_action(&t, "nope") == TINYMCP_INPUT_NONE);
+    CHECK(tinymcp_input_bool(&t, "confirm", "confirm") == 1);
+    CHECK(tinymcp_input_bool(&t, "confirm", "n") == -1);
+    CHECK(tinymcp_input_bool(&t, "x", "confirm") == -1);
+    CHECK(tinymcp_request_state(&t, buf, sizeof buf) == 3 && !strcmp(buf, "abc"));
+    CHECK(tinymcp_request_state(&t, buf, 3) == -1);
+    t.in_responses.type = TINYMCP_J_NONE;
+    t.in_state.type = TINYMCP_J_NONE;
+}
+
 int main(void)
 {
     json_edges();
@@ -1295,6 +1429,8 @@ int main(void)
     prompts_changed();
     prompt_templates();
     client_names();
+    consent();
+    consent_accessors();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

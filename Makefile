@@ -1,5 +1,5 @@
 #
-# tinymcp v0.3
+# tinymcp v0.4
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
