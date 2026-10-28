@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# tinymcp v0.6
+# tinymcp v0.7
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
@@ -66,10 +66,10 @@ def read_line(stream, timeout=5.0):
     return out[0] if out else b""
 
 
-def start(args, port):
+def start(args, port, env=None):
     p = subprocess.Popen([sys.executable, BRIDGE] + args + ([port] if port else []),
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE)
+                         stderr=subprocess.PIPE, env=env)
     opened = read_line(p.stderr)
     expect(b"opened" in opened, f"bridge opened: {opened!r}")
     return p
@@ -169,6 +169,28 @@ def tcp():
     expect(p.wait(timeout=5) == 0, "tcp bridge exits")
 
 
+def tcp_keyed():
+    """With TINYMCP_KEY set, each request carries it in params._meta."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    p = start(["--tcp", f"127.0.0.1:{port}"], None,
+              env=dict(os.environ, TINYMCP_KEY="k3y-\"q\""))
+    conn, _ = srv.accept()
+    conn.settimeout(5)
+    p.stdin.write(b'{"jsonrpc":"2.0","id":5,"method":"tools/call","params":'
+                  b'{"name":"read","_meta":{"progressToken":1}}}\n')
+    p.stdin.flush()
+    got = json.loads(conn.recv(4096))
+    expect(got["params"]["_meta"] == {"progressToken": 1, "org.tinymcp/key": 'k3y-"q"'}
+           and got["params"]["name"] == "read", f"the key in _meta: {got}")
+    conn.close()
+    srv.close()
+    p.stdin.close()
+    expect(p.wait(timeout=5) == 0, "keyed bridge exits")
+
+
 def held_port():
     master, name = open_pty()
     with open(name, "rb") as held:
@@ -193,6 +215,13 @@ def unit():
     expect(bridge.listen_ids(b'{"id":9,"method":"subscriptions/listen"}') == 9, "listen id")
     expect(bridge.listen_ids(b'{"id":9,"method":"ping"}') is None, "not a listen")
     expect(bridge.listen_ids(b"junk") is None, "junk line")
+    keyed = json.loads(bridge.with_key(b'{"id":1,"method":"ping"}', "s3cret"))
+    expect(keyed["params"]["_meta"]["org.tinymcp/key"] == "s3cret", f"key added: {keyed}")
+    expect(bridge.with_key(b'{"id":1,"result":{}}', "k") == b'{"id":1,"result":{}}',
+           "a response goes as it came")
+    expect(bridge.with_key(b"junk", "k") == b"junk", "junk goes as it came")
+    expect(bridge.with_key(b'{"id":1,"method":"x","params":[1]}', "k") ==
+           b'{"id":1,"method":"x","params":[1]}', "params that are not an object")
 
 
 if __name__ == "__main__":
@@ -200,6 +229,7 @@ if __name__ == "__main__":
     serial_framed()
     serial_raw()
     tcp()
+    tcp_keyed()
     if sys.platform != "win32":
         held_port()
     print(f"{checks} checks, {failures} failures")

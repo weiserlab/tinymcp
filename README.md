@@ -30,9 +30,9 @@ hygiene/                        the commit and style checks
 
 | Measured on 2026-10-28 | |
 |---|---|
-| code, `-Os`, Cortex-M33 (`make size`) | 17.2 KB (`tinymcp.c` 14.4 KB, `tinymcp_json.c` 2.8 KB) |
-| code, `-Os`, Cortex-M0+ | 17.4 KB |
-| one instance, `tinymcp_t`, four subscription slots, two kept calls, Cortex-M33 | 888 bytes |
+| code, `-Os`, Cortex-M33 (`make size`) | 17.3 KB (`tinymcp.c` 14.4 KB, `tinymcp_json.c` 2.8 KB) |
+| code, `-Os`, Cortex-M0+ | 17.5 KB |
+| one instance, `tinymcp_t`, four subscription slots, two kept calls, Cortex-M33 | 900 bytes |
 | stack during a tool call | about 1 KB (the argument table) |
 | buffers | the host's: the in buffer holds one request, the out buffer one reply, or one piece of a longer one |
 
@@ -106,6 +106,10 @@ no result is sent for it; `tinymcp_closed()` cancels every kept call.
 These calls are made from outside the host functions, from the host's
 loop.
 
+`tinymcp_meta()` reads a string member of the request's `params._meta`
+while a host function serves it: the place a credential travels, such as
+the key tikuOS checks on a TCP connection (`org.tinymcp/key`).
+
 `name`, `title` and `version` are the host's `serverInfo`; the library
 names itself in the `org.tinymcp/library` member of the `_meta` of the
 discover and initialize results.  `tinymcp_client()` is the name the
@@ -167,7 +171,13 @@ claude mcp add pico2 -- python3 bridge/tinymcp.py /dev/cu.usbmodem1101
 
 The bridge keeps no protocol state.  When its stdin closes it sends
 `notifications/cancelled` for every `subscriptions/listen` it relayed,
-since the device has no connection to see close.
+since the device has no connection to see close.  With `TINYMCP_KEY` in its
+environment it puts that key in every request's `_meta` as
+`org.tinymcp/key`; the key never appears on its command line.
+
+```
+TINYMCP_KEY=... claude mcp add board -- python3 bridge/tinymcp.py --tcp 172.16.7.2:7000
+```
 
 ## Answering a board
 
@@ -193,7 +203,7 @@ make                 # examples/posix/tinymcp_posix
 make test            # the protocol against a fake host, under the sanitizers
 make mutants         # each check fails on a build that breaks what it guards
 make conformance     # the official mcp SDK client in three modes, in .venv
-make test-bridge     # the bridge against a fake device on a pty and a socket
+make test-bridge     # the bridge against a fake device on a pty and a socket, and its key
 make test-attend     # attend.py against a stub of the Messages API
 make check           # all of the above
 make size            # code size on a Cortex-M33 (arm-none-eabi-gcc)

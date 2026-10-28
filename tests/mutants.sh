@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# tinymcp v0.6
+# tinymcp v0.7
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
@@ -129,6 +129,11 @@ mutate structured-sticky tinymcp.c '/^out:$/,/busy = 0/s/    t->structured = NUL
 mutate output-schema tinymcp.c 's/        if (tool->output_schema) {/        if (0) {/'
 mutate late-read-error tinymcp.c '/it ends, short/,/errors++/s/        r->t->errors++;/        ;/'
 mutate late-tool-error tinymcp.c '/a failure is isError/,/rc = TINYMCP_TOOL_ERROR;/s/        rc = TINYMCP_TOOL_ERROR;/        ;/'
+
+mutate meta-fits tinymcp.c 's/        v.type != TINYMCP_J_STRING || v.len + 1 > cap)/        v.type != TINYMCP_J_STRING || v.len > cap)/'
+mutate meta-any-type tinymcp.c '/^int tinymcp_meta/,/^}/s/        v.type != TINYMCP_J_STRING || /        /'
+mutate meta-left tinymcp.c '/^out:$/,/busy = 0/s/    t->cur_meta.type = TINYMCP_J_NONE;/    ;/'
+mutate meta-not-kept tinymcp.c 's/        t->cur_meta = meta;/        ;/'
 
 echo "$total mutants, $survived survived"
 [ "$survived" -eq 0 ]

@@ -1,5 +1,5 @@
 /*
- * tinymcp v0.6
+ * tinymcp v0.7
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
@@ -289,6 +289,13 @@ static int fake_tool(void *ctx, const char *name, const tinymcp_args_t *args,
         tinymcp_sink_puts(text, "{\"n\":1}");
         return TINYMCP_OK;
     }
+    if (!strcmp(name, "key")) {
+        char key[16];
+        int n = tinymcp_meta(touch_target, "org.tinymcp/key", key, sizeof key);
+
+        tinymcp_sink_puts(text, n < 0 ? "none" : key);
+        return TINYMCP_OK;
+    }
     if (!strcmp(name, "latefail")) {
         int i;
 
@@ -461,6 +468,7 @@ static const tinymcp_tool_t content_tools[] = {
     { "stat", NULL, "{\"type\":\"object\"}", "{\"type\":\"object\"}" },
     { "latefail", NULL, "{\"type\":\"object\"}", NULL },
     { "slow", NULL, "{\"type\":\"object\"}", NULL },
+    { "key", NULL, "{\"type\":\"object\"}", NULL },
 };
 
 static const tinymcp_host_t host_content = {
@@ -1771,6 +1779,42 @@ static void content_kinds(void)
     CHECK(tinymcp_sink_binary(&plain, "image/png") == -1);
 }
 
+#define KEYED(id, key) "{\"jsonrpc\":\"2.0\",\"id\":" id ",\"method\":" \
+    "\"tools/call\",\"params\":{\"name\":\"key\",\"_meta\":{" \
+    "\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"," \
+    "\"io.modelcontextprotocol/clientCapabilities\":{}," \
+    "\"org.tinymcp/key\":" key "}}}"
+
+/* A request's _meta member, read by the host while it serves it. */
+static void meta_members(void)
+{
+    char buf[8];
+
+    reset(&host_content, sizeof out_buf, 4);
+    say(KEYED("1", "\"s\\u0065cret\""));
+    CONTAINS(last(), "\"text\":\"secret\"}]");
+    say(KEYED("2", "7"));
+    CONTAINS(last(), "\"text\":\"none\"}]");
+    say(KEYED("3", "\"0123456789abcde\""));
+    CONTAINS(last(), "\"text\":\"0123456789abcde\"}]");
+    say(KEYED("4", "\"0123456789abcdef\""));
+    CONTAINS(last(), "\"text\":\"none\"}]");
+    say(CALL("5", "key", META));
+    CONTAINS(last(), "\"text\":\"none\"}]");
+    /* The handshake era carries it in each request's _meta too. */
+    say("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"initialize\",\"params\":{"
+        "\"protocolVersion\":\"2025-11-25\",\"capabilities\":{}}}");
+    say("{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":"
+        "{\"name\":\"key\"}}");
+    CONTAINS(last(), "\"text\":\"none\"}]");
+    say("{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":"
+        "{\"name\":\"key\",\"_meta\":{\"org.tinymcp/key\":\"old\"}}}");
+    CONTAINS(last(), "\"text\":\"old\"}]");
+    /* Between requests there is none. */
+    CHECK(t.cur_meta.type == TINYMCP_J_NONE);
+    CHECK(tinymcp_meta(&t, "org.tinymcp/key", buf, sizeof buf) == -1);
+}
+
 /* With send_part, content past the out buffer goes out in pieces. */
 static void streaming(void)
 {
@@ -1855,6 +1899,7 @@ int main(void)
     later_calls();
     content_kinds();
     streaming();
+    meta_members();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

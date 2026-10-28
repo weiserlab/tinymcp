@@ -63,10 +63,14 @@ and `POKE` are errors in it, and a write to a node that needs
 ## Streams
 
 One `tinymcp_t` per stream: the console channel, and one TCP connection
-at a time from `mcp listen`.  The console channel's callback copies the
-frame and marks it pending; the request runs from the shell's pump
-between command lines, never inside the callback.  The host bridge
-(`bridge/tinymcp.py`) turns a client's stdio into those frames.
+at a time from `mcp listen <port>`, newline-delimited.  The console
+channel's callback copies the frame and marks it pending; the request runs
+from the shell's pump between command lines, never inside the callback.
+The TCP connection's in and out buffers are an arena leased from the SRAM
+tier when it connects and zeroed and given back when it closes; a reply
+goes out in MSS-sized segments, the console pumped while the TX pool is
+full.  The host bridge (`bridge/tinymcp.py`) turns a client's stdio into
+console frames, or with `--tcp` into lines on the connection.
 
 ## Buffers
 
@@ -79,7 +83,10 @@ between command lines, never inside the callback.  The host bridge
 ## Authority
 
 The console channel carries the owner's capability (every write
-allowed).  A TCP stream opened by `mcp listen <port>` carries none:
-`write`, `shell` and `basic` answer `isError` "read-only carrier" until
-the owner typed `mcp listen <port> all` at the console or placed it in
-the init table.
+allowed).  A TCP request has it only when its `_meta` carries
+`org.tinymcp/key` equal to the key the owner wrote to `/sys/mcp/key`
+(8 to 32 characters, kept in a persist cell, read back only as `set` or
+`none`).  Without it the connection reads: `write`, `shell` and `basic`
+answer `isError`, a node that is secret or whose read acts is refused, and
+the request's VFS writes carry no capability.  With it, the owner's consent
+still asks before the actions on its list.

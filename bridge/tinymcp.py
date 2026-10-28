@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# tinymcp v0.6
+# tinymcp v0.7
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
@@ -207,6 +207,32 @@ def listen_ids(line):
     return None
 
 
+KEY_META = "org.tinymcp/key"
+
+
+def with_key(line, key):
+    """line with key in its params._meta, the owner's authority on a board
+    reached over TCP; a line that is not a JSON object goes as it came."""
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        return line
+    if not isinstance(msg, dict) or "method" not in msg:
+        return line
+    params = msg.get("params")
+    if params is None:
+        params = msg["params"] = {}
+    if not isinstance(params, dict):
+        return line
+    meta = params.get("_meta")
+    if meta is None:
+        meta = params["_meta"] = {}
+    if not isinstance(meta, dict):
+        return line
+    meta[KEY_META] = key
+    return json.dumps(msg, separators=(",", ":")).encode()
+
+
 def cancelled(request_id):
     return json.dumps({"jsonrpc": "2.0", "method": "notifications/cancelled",
                        "params": {"requestId": request_id}}).encode()
@@ -231,7 +257,10 @@ def main():
     else:
         link = SerialLink(args.port, args.baud, args.raw)
         where = args.port
-    sys.stderr.write(f"tinymcp: opened {where}\n")
+    # The key comes from the environment, never the command line, which other
+    # users of the host can read.
+    key = os.environ.get("TINYMCP_KEY", "")
+    sys.stderr.write(f"tinymcp: opened {where}{' with the key' if key else ''}\n")
     sys.stderr.flush()
 
     out = sys.stdout.buffer
@@ -283,7 +312,7 @@ def main():
             lid = listen_ids(line)
             if lid is not None:
                 listens.append(lid)
-            link.send(line)
+            link.send(with_key(line, key) if key else line)
             if done.is_set():
                 break
     except KeyboardInterrupt:

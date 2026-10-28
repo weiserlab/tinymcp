@@ -1,5 +1,5 @@
 /*
- * tinymcp v0.6
+ * tinymcp v0.7
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
@@ -1484,6 +1484,7 @@ static void process(tinymcp_t *t, char *msg, size_t len)
     t->el_key = t->el_message = t->el_schema = t->el_state = NULL;
     t->cur_id.type = TINYMCP_J_NONE;
     t->cur_token.type = TINYMCP_J_NONE;
+    t->cur_meta.type = TINYMCP_J_NONE;
     t->cur_modern = 0;
     t->deferred = 0;
     t->structured = NULL;
@@ -1564,11 +1565,14 @@ static void process(tinymcp_t *t, char *msg, size_t len)
         else
             t->client[0] = 0;
     }
-    /* Kept in place, for a call the host may keep open. */
-    if (param(&r, "_meta", &meta) && meta.type == TINYMCP_J_OBJECT &&
-        tinymcp_json_get(&meta, "progressToken", &v) == 1 &&
-        (v.type == TINYMCP_J_STRING || v.type == TINYMCP_J_NUMBER))
-        t->cur_token = v;
+    /* Kept in place: the token for a call the host may keep open, the
+     * whole object for tinymcp_meta(). */
+    if (param(&r, "_meta", &meta) && meta.type == TINYMCP_J_OBJECT) {
+        t->cur_meta = meta;
+        if (tinymcp_json_get(&meta, "progressToken", &v) == 1 &&
+            (v.type == TINYMCP_J_STRING || v.type == TINYMCP_J_NUMBER))
+            t->cur_token = v;
+    }
     t->cur_id = r.id;
     t->cur_modern = (unsigned char)r.modern;
     dispatch(&r);
@@ -1576,6 +1580,7 @@ out:
     t->structured = NULL;
     t->cur_id.type = TINYMCP_J_NONE;
     t->cur_token.type = TINYMCP_J_NONE;
+    t->cur_meta.type = TINYMCP_J_NONE;
     t->deferred = 0;
     t->busy = 0;
     t->elicits = 0;
@@ -1752,6 +1757,19 @@ const char *tinymcp_era_name(const tinymcp_t *t)
 const char *tinymcp_client(const tinymcp_t *t)
 {
     return t->client;
+}
+
+int tinymcp_meta(const tinymcp_t *t, const char *key, char *buf, size_t cap)
+{
+    tinymcp_jv_t v;
+
+    /* Copied, then decoded in the copy: the message is not changed. */
+    if (t->cur_meta.type != TINYMCP_J_OBJECT ||
+        tinymcp_json_get(&t->cur_meta, key, &v) != 1 ||
+        v.type != TINYMCP_J_STRING || v.len + 1 > cap)
+        return -1;
+    memcpy(buf, v.at, v.len);
+    return tinymcp_json_decode(buf, v.len);
 }
 
 int tinymcp_client_elicits(const tinymcp_t *t)

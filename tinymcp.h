@@ -1,5 +1,5 @@
 /*
- * tinymcp v0.6
+ * tinymcp v0.7
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
@@ -24,7 +24,7 @@
 extern "C" {
 #endif
 
-#define TINYMCP_VERSION  "0.6.0"
+#define TINYMCP_VERSION  "0.7.0"
 #define TINYMCP_API      4             /* bumped on any change to tinymcp_host_t */
 #define TINYMCP_PROTOCOL "2026-07-28"  /* the newest revision served */
 
@@ -292,6 +292,7 @@ typedef struct tinymcp {
     const char *el_state;
     tinymcp_jv_t cur_id;        /* the request being handled, its id */
     tinymcp_jv_t cur_token;     /* and its _meta.progressToken, or J_NONE */
+    tinymcp_jv_t cur_meta;      /* and its params._meta object, or J_NONE */
     unsigned char cur_modern;
     unsigned char in_call;      /* inside tool_call: tinymcp_defer() may keep it */
     unsigned char deferred;     /* the handle tinymcp_defer() gave this call, or 0 */
@@ -365,6 +366,14 @@ const char *tinymcp_client(const tinymcp_t *t);
  * and sends the request again, with the answers and the state, which the
  * host reads through the tinymcp_input_* calls while it runs.
  */
+
+/**
+ * The string member key of the request's params._meta, decoded into buf,
+ * while a host function serves it: a credential such as "org.tinymcp/key".
+ * @return its length, or -1 when it is absent, not a string, or does not
+ *         fit cap - 1.
+ */
+int tinymcp_meta(const tinymcp_t *t, const char *key, char *buf, size_t cap);
 
 /** True when the request being served can carry input_required: the
  *  2026-07-28 revision, from a client that declared elicitation. */
