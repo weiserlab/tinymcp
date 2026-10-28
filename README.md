@@ -20,6 +20,7 @@ complete host for a POSIX system and the conformance target.
 ```
 tinymcp.h, tinymcp.c            the server: eras, methods, errors, subscriptions, prompts
 tinymcp_json.h, tinymcp_json.c  the scanner, in-place decoding, the bounded writer
+tinymcp_http.h, tinymcp_http.c  Streamable HTTP for the 2026-07-28 revision
 examples/posix/                 a server over stdio: a directory as resources and prompts, a shell tool
 bridge/tinymcp.py               an MCP client's stdio to a device's serial port or TCP port
 bridge/attend.py                answers a board's questions from the Anthropic API, opt-in
@@ -30,8 +31,9 @@ hygiene/                        the commit and style checks
 
 | Measured on 2026-10-28 | |
 |---|---|
-| code, `-Os`, Cortex-M33 (`make size`) | 17.3 KB (`tinymcp.c` 14.4 KB, `tinymcp_json.c` 2.8 KB) |
-| code, `-Os`, Cortex-M0+ | 17.5 KB |
+| code, `-Os`, Cortex-M33 (`make size`) | 17.3 KB (`tinymcp.c` 14.4 KB, `tinymcp_json.c` 2.8 KB), and `tinymcp_http.c` 4.4 KB for HTTP |
+| code, `-Os`, Cortex-M0+ | 17.5 KB, and 4.5 KB for HTTP |
+| one HTTP connection's parser, `tinymcp_http_t` | 620 bytes |
 | one instance, `tinymcp_t`, four subscription slots, two kept calls, Cortex-M33 | 900 bytes |
 | stack during a tool call | about 1 KB (the argument table) |
 | buffers | the host's: the in buffer holds one request, the out buffer one reply, or one piece of a longer one |
@@ -152,8 +154,34 @@ served statelessly as the 2026-07-28 revision asks, with
 requests that follow.  `input_required` is served to a client of the
 current revision; the handshake era's direct `elicitation/create` is not.
 Text, blob, image and audio content and structured results; no
-sampling, no HTTP.  A host
-with an HTTP server wraps `tinymcp_message()`.
+sampling.
+
+## Serving HTTP
+
+`tinymcp_http.c` serves the 2026-07-28 revision's Streamable HTTP over any
+byte connection the host has: one `tinymcp_http_t` in front of one
+`tinymcp_t` per connection, the host's TCP bytes fed in with
+`tinymcp_http_feed()`, and the server's `send` and `send_part` passed to
+`tinymcp_http_send()` and `tinymcp_http_send_part()`.  A request is a POST
+to the host's path, its body read into the instance's in buffer.  The
+`MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` headers are checked
+against the body (`-32020` on a mismatch or a repeat), `Accept` must carry
+JSON and the event stream (406), `Content-Type` JSON (415), and an `Origin`
+the host did not list is refused (403); another method is 405, another path
+404, a body past the buffer 413, and these keep the connection by reading
+past the body.  A notification is accepted (202) and dropped, as the
+revision defines none over HTTP; `initialize` is refused for want of
+`_meta`.  A reply that fits goes out as JSON with its length and the
+status the spec gives its error code; one past the out buffer goes in
+chunks; a notification before the reply, a kept call's progress or a
+listen's updates, turns the response into an event stream, which the reply
+ends.  A client cancels by closing the connection, and the host's
+`tinymcp_closed()` then cancels the kept call.  `tinymcp_http_bearer()` is
+the request's `Authorization: Bearer` token for the host to judge.
+
+```
+./build/tinymcp_posix --dir . --http 8080     # POST http://127.0.0.1:8080/mcp
+```
 
 ## The bridge
 
@@ -202,7 +230,7 @@ ANTHROPIC_API_KEY=... python3 bridge/attend.py /dev/cu.usbmodem1101
 make                 # examples/posix/tinymcp_posix
 make test            # the protocol against a fake host, under the sanitizers
 make mutants         # each check fails on a build that breaks what it guards
-make conformance     # the official mcp SDK client in three modes, in .venv
+make conformance     # the official mcp SDK client, three stdio modes and HTTP, in .venv
 make test-bridge     # the bridge against a fake device on a pty and a socket, and its key
 make test-attend     # attend.py against a stub of the Messages API
 make check           # all of the above
@@ -218,7 +246,9 @@ only after its elicitation callback says yes, and follows the example's
 `count` tool: its progress, an echo answered while it counts, a cancel;
 it reads a 108 KB file and a 108 KB tool result whole through a 32 KB out
 buffer, a binary file as a blob, an image from a tool and a structured
-result checked against its output schema.
+result checked against its output schema.  The same run goes over the
+example's HTTP port through the SDK's Streamable HTTP client, beside the
+wire rules it does not exercise.
 
 ## Licence
 

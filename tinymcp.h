@@ -1,5 +1,5 @@
 /*
- * tinymcp v0.7
+ * tinymcp v0.8
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
@@ -24,7 +24,7 @@
 extern "C" {
 #endif
 
-#define TINYMCP_VERSION  "0.7.0"
+#define TINYMCP_VERSION  "0.8.0"
 #define TINYMCP_API      4             /* bumped on any change to tinymcp_host_t */
 #define TINYMCP_PROTOCOL "2026-07-28"  /* the newest revision served */
 

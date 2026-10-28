@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# tinymcp v0.7
+# tinymcp v0.8
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
@@ -19,7 +19,7 @@ once its `slip` command is on.  SlipTcp opens one connection to the board,
 acknowledges each segment it receives, and keeps within the window the
 board advertises.  The cable loses nothing, so nothing is retransmitted:
 this is a test fixture, not a stack.  relay() accepts local TCP clients
-one at a time and joins each to a board connection.
+and joins each to its own board connection.
 """
 
 import random
@@ -60,7 +60,8 @@ def frame(pkt):
 
 
 class Wire:
-    """The console line: IP packets out of its frames, the rest dropped."""
+    """The console line: IP packets out of its frames, each handed to the
+    connection whose port it names; the rest dropped."""
 
     def __init__(self, ser):
         self.ser = ser
@@ -69,6 +70,7 @@ class Wire:
         self.inside = False
         self.esc = False
         self.packets = []
+        self.conns = {}     # our port -> SlipTcp
 
     def send(self, pkt):
         with self.lock:
@@ -82,18 +84,23 @@ class Wire:
             self.ser.flush()
 
     def poll(self, secs=0.02):
-        """Read what waits; the IP packets that completed."""
+        """Read what waits, for up to secs, and hand each packet on."""
         end = time.monotonic() + secs
         while True:
             n = self.ser.in_waiting
             data = self.ser.read(n) if n else b""
             for b in data:
                 self.feed(b)
-            if self.packets or time.monotonic() >= end:
+            got, self.packets = self.packets, []
+            for pkt in got:
+                ihl = (pkt[0] & 15) * 4
+                if pkt[9] == 6 and len(pkt) >= ihl + 4:
+                    conn = self.conns.get(struct.unpack("!H", pkt[ihl + 2:ihl + 4])[0])
+                    if conn:
+                        conn._segment(pkt)
+            if got or time.monotonic() >= end:
                 break
             time.sleep(0.002)
-        out, self.packets = self.packets, []
-        return out
 
     def feed(self, b):
         if b == END:
@@ -131,6 +138,7 @@ class SlipTcp:
         self.rx = bytearray()
         self.state = "closed"
         self.ipid = 0
+        wire.conns[self.sport] = self
 
     def _send(self, flags, payload=b"", opts=b""):
         doff = (20 + len(opts)) // 4
@@ -184,8 +192,7 @@ class SlipTcp:
             self.state = "peer-closed"
 
     def turn(self, secs=0.02):
-        for pkt in self.w.poll(secs):
-            self._segment(pkt)
+        self.w.poll(secs)
 
     def connect(self, timeout=5.0):
         self.state = "syn-sent"
@@ -225,43 +232,57 @@ class SlipTcp:
                     and self.state != "reset" and time.monotonic() < end:
                 self.turn(0.05)
         self.state = "closed"
+        self.w.conns.pop(self.sport, None)
 
 
 def relay(wire, board_port, stop, ready):
-    """Accept local clients one at a time on a free port, each joined to a
-    connection to board_port; ready gets the port; until stop is set."""
+    """Accept local clients on a free port, each joined to its own connection
+    to board_port; ready gets the port; until stop is set."""
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", 0))
-    srv.listen(1)
-    srv.settimeout(0.2)
+    srv.listen(8)
+    srv.setblocking(False)
     ready.append(srv.getsockname()[1])
+    pairs = []
     while not stop.is_set():
         try:
             client, _ = srv.accept()
-        except socket.timeout:
-            continue
-        tcp = SlipTcp(wire, board_port)
-        if not tcp.connect():
-            client.close()
-            continue
-        client.setblocking(False)
-        while not stop.is_set() and tcp.state == "open":
+            tcp = SlipTcp(wire, board_port)
+            if tcp.connect():
+                client.setblocking(False)
+                pairs.append((client, tcp))
+            else:
+                tcp.close()
+                client.close()
+        except BlockingIOError:
+            pass
+        for client, tcp in list(pairs):
+            done = False
             r, _, _ = select.select([client], [], [], 0)
             if r:
                 try:
                     data = client.recv(4096)
                 except OSError:
                     data = b""
-                if not data:
-                    break
-                tcp.send(data)
-            tcp.turn(0.01)
+                if data:
+                    tcp.send(data)
+                else:
+                    done = True
             got = tcp.take()
             if got:
                 client.setblocking(True)
-                client.sendall(got)
+                try:
+                    client.sendall(got)
+                except OSError:
+                    done = True
                 client.setblocking(False)
+            if done or tcp.state != "open":
+                tcp.close()
+                client.close()
+                pairs.remove((client, tcp))
+        wire.poll(0.01)
+    for client, tcp in pairs:
         tcp.close()
         client.close()
     srv.close()

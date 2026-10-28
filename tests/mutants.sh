@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# tinymcp v0.7
+# tinymcp v0.8
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
@@ -23,7 +23,8 @@ total=0
 mutate() {
     name=$1; file=$2; expr=$3
     total=$((total + 1))
-    cp tinymcp.c tinymcp_json.c tinymcp.h tinymcp_json.h build/mutant/
+    cp tinymcp.c tinymcp_json.c tinymcp_http.c tinymcp.h tinymcp_json.h \
+        tinymcp_http.h build/mutant/
     sed -e "$expr" "$file" > "build/mutant/$file.tmp" && mv "build/mutant/$file.tmp" "build/mutant/$file"
     if cmp -s "$file" "build/mutant/$file"; then
         echo "mutant $name: the pattern no longer matches; update the script"
@@ -31,7 +32,8 @@ mutate() {
         return
     fi
     if ! $CC $CFLAGS -o build/mutant/test tests/test_tinymcp.c \
-            build/mutant/tinymcp.c build/mutant/tinymcp_json.c 2>build/mutant/cc.log; then
+            build/mutant/tinymcp.c build/mutant/tinymcp_json.c \
+            build/mutant/tinymcp_http.c 2>build/mutant/cc.log; then
         echo "mutant $name: caught at compile time"
         return
     fi
@@ -134,6 +136,30 @@ mutate meta-fits tinymcp.c 's/        v.type != TINYMCP_J_STRING || v.len + 1 > 
 mutate meta-any-type tinymcp.c '/^int tinymcp_meta/,/^}/s/        v.type != TINYMCP_J_STRING || /        /'
 mutate meta-left tinymcp.c '/^out:$/,/busy = 0/s/    t->cur_meta.type = TINYMCP_J_NONE;/    ;/'
 mutate meta-not-kept tinymcp.c 's/        t->cur_meta = meta;/        ;/'
+
+mutate http-dup tinymcp_http.c 's/    if (h->dup) {/    if (0) {/'
+mutate http-version tinymcp_http.c 's/    if (!h->version\[0\] || !same(\&pv, h->version)) {/    if (0) {/'
+mutate http-method tinymcp_http.c 's/    if (!same(\&method, h->method)) {/    if (0) {/'
+mutate http-name tinymcp_http.c 's/        (unwrap(h->name) < 0 || !same(\&v, h->name))) {/        0) {/'
+mutate http-unwrap tinymcp_http.c 's/    if (n < 12 || strncmp(s, "=?base64?", 9) || strcmp(s + n - 2, "?="))/    if (1)/'
+mutate http-notify tinymcp_http.c 's/        plain(h, 202, NULL);/        plain(h, 200, NULL);/'
+mutate http-meta-rung tinymcp_http.c 's/        tinymcp_json_get(\&meta, META_PV, \&pv) != 1) {/        0) {/'
+mutate http-origin tinymcp_http.c 's/    h->flags |= F_ORIGIN_BAD;/    ;/'
+mutate http-skip tinymcp_http.c 's/    h->skip = (unsigned short)status;/    h->skip = 0;/'
+mutate http-accept tinymcp_http.c 's/    } else if ((h->flags \& (F_ACC_JSON | F_ACC_SSE)) !=/    } else if (0 \&\& (h->flags \& (F_ACC_JSON | F_ACC_SSE)) !=/'
+mutate http-ctype tinymcp_http.c 's/    } else if (!(h->flags \& F_CTYPE)) {/    } else if (0) {/'
+mutate http-too-large tinymcp_http.c 's/    } else if (h->body_len + 1 > h->t->in_cap) {/    } else if (h->body_len > h->t->in_cap) {/'
+mutate http-status tinymcp_http.c 's/        case 32601:/        case 1:/'
+mutate http-sse tinymcp_http.c '/^int tinymcp_http_send(/,/^}/s/        commit_sse(h);/        ;/'
+mutate http-chunk-size tinymcp_http.c 's/    put_num(h, (unsigned long)n, 16);/    put_num(h, (unsigned long)n + 1, 16);/'
+mutate http-event-size tinymcp_http.c 's/                               sizeof EVENT_TAIL - 1), 16);/                               sizeof EVENT_TAIL), 16);/'
+mutate http-1-0 tinymcp_http.c '/HTTP\/1.0/{n;s/        h->flags |= F_CLOSE;/        ;/;}'
+mutate http-keep-alive tinymcp_http.c 's/                                    : TINYMCP_HTTP_S_LINE;/                                    : TINYMCP_HTTP_S_CLOSE;/'
+mutate http-owed-stops tinymcp_http.c 's/    while (i < n \&\& h->state <= TINYMCP_HTTP_S_BODY) {/    while (i < n \&\& h->state != TINYMCP_HTTP_S_CLOSE) {/'
+mutate http-bearer tinymcp_http.c 's/        if (starts(v, "bearer ") \&\& strlen(v + 7) < sizeof h->bearer)/        if (strlen(v) < sizeof h->bearer)/'
+mutate http-long tinymcp_http.c 's/            h->flags |= F_LONG;/            ;/'
+mutate http-parse tinymcp_http.c 's/        rpc_error(h, 400, NULL, -32700, "parse error");/        rpc_error(h, 400, NULL, -32600, "parse error");/'
+mutate http-no-length tinymcp_http.c 's/               (!(h->flags \& F_LENGTH) \&\& (h->flags \& F_POST))) {/               0) {/'
 
 echo "$total mutants, $survived survived"
 [ "$survived" -eq 0 ]

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# tinymcp v0.7
+# tinymcp v0.8
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
@@ -85,7 +85,7 @@ async def checks_open(port, wire):
         tcp = await read(c, "/sys/mcp/tcp")
         tools = sorted(t.name for t in (await c.list_tools()).tools)
         up = (await c.read_resource("tiku:///sys/uptime")).contents[0].text.strip()
-        expect("tcp-read", tcp.startswith(f"connected {PORT} 172.16.7.1:") and up.isdigit()
+        expect("tcp-read", tcp.startswith(f"lines {PORT}, connected 172.16.7.1:") and up.isdigit()
                and "read" in tools, f"{tcp!r}; uptime {up}; tools {tools}")
         whole = (await c.read_resource("tiku:///sys/vfs/manifest")).contents[0].text
         expect("tcp-long", len(whole) > 4608 and whole.endswith("\n") and "[cut]" not in whole,
@@ -180,7 +180,8 @@ async def main(port_name):
     wire.type(f"mcp listen {PORT}")
     drain(0.8)
     said = console.decode("latin-1")
-    expect("tcp-listen", f"tcp listening {PORT}" in said, said.strip().splitlines()[-2:])
+    expect("tcp-listen", f"lines {PORT}\r\n" in said or f"lines {PORT}\n" in said,
+           said.strip().splitlines()[-4:])
     one_at_a_time(wire)
 
     stop = threading.Event()
@@ -197,7 +198,7 @@ async def main(port_name):
             await anyio.sleep(0.5)
             tcp = await read(c, "/sys/mcp/tcp")
             again = arenas(await read(c, "/sys/mem/reservations"))
-        expect("tcp-lease", during == again and tcp.startswith("connected"),
+        expect("tcp-lease", during == again and ", connected " in tcp,
                f"live SRAM arenas during the first connection {during}, during a later one {again}")
     finally:
         stop.set()

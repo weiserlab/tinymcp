@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 #
-# tinymcp v0.7
+# tinymcp v0.8
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
 # Authors: Ambuj Varshney <ambuj@tiku-os.org>
 #
-# conformance.py - the official mcp SDK client against the POSIX example,
-# pinned to 2026-07-28, auto-negotiated and through the handshake: every
+# conformance.py - the official mcp SDK client against the POSIX example over
+# stdio (pinned, auto-negotiated, the handshake) and Streamable HTTP: every
 # method, consent, calls answered later, streamed, binary and typed content.
 #
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
 import base64
+import http.client
+import json
+import subprocess
 import os
 import re
 import sys
@@ -23,6 +26,8 @@ import anyio
 import mcp_types as types
 from mcp import Client, MCPError
 from mcp.client.stdio import StdioServerParameters
+from mcp.client.streamable_http import streamable_http_client
+from mcp.shared._httpx_utils import create_mcp_http_client
 from mcp.shared.subscriptions import (PromptsListChanged, ResourcesListChanged,
                                       ResourceUpdated)
 
@@ -74,7 +79,7 @@ async def common(c, mode, dirpath):
 
     tools = await c.list_tools()
     names = sorted(t.name for t in tools.tools)
-    expect(names == ["count", "counters", "echo", "picture", "remove", "shell", "stat", "whoami", "write"], f"tool names {names}")
+    expect(names == ["bearer", "count", "counters", "echo", "picture", "remove", "shell", "stat", "whoami", "write"], f"tool names {names}")
     r = await c.call_tool("whoami", {})
     expect(text_of(r) == "conformance", f"the client's name {text_of(r)!r}")
     echo = next(t for t in tools.tools if t.name == "echo")
@@ -338,6 +343,111 @@ async def legacy_subscriptions(c, seen):
         expect(e.error.code == -32002, f"missing subscription code {e.error.code}")
 
 
+TOKEN = "conformance-token"
+META = {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}}
+
+
+def post(port, body, headers=None, method="POST", path="/mcp"):
+    """One raw request: (status, headers, body text)."""
+    h = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+         "MCP-Protocol-Version": "2026-07-28"}
+    if isinstance(body, dict) and "method" in body:
+        h["Mcp-Method"] = body["method"]
+    h.update(headers or {})
+    h = {k: v for k, v in h.items() if v is not None}
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    data = json.dumps(body).encode() if isinstance(body, dict) else body
+    c.request(method, path, body=data, headers=h)
+    r = c.getresponse()
+    out = (r.status, dict((k.lower(), v) for k, v in r.getheaders()), r.read().decode())
+    c.close()
+    return out
+
+
+def http_wire(port):
+    """The HTTP rules the SDK's client does not exercise."""
+    ping = {"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {"_meta": META}}
+    expect(post(port, ping)[0] == 200, "a ping is 200")
+    st, hd, _ = post(port, ping, method="GET")
+    expect(st == 405 and hd.get("allow") == "POST", f"GET is 405 with Allow: POST ({st})")
+    expect(post(port, ping, path="/other")[0] == 404, "another path is 404")
+    expect(post(port, ping, {"Origin": "http://evil.example"})[0] == 403, "a web origin is 403")
+    expect(post(port, ping, {"Accept": "application/json"})[0] == 406, "no event-stream accept is 406")
+    expect(post(port, ping, {"Content-Type": "text/plain"})[0] == 415, "a text body is 415")
+    note = {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 1}}
+    st, _, body = post(port, note)
+    expect(st == 202 and body == "", f"a notification is 202 and dropped ({st})")
+    st, _, body = post(port, ping, {"Mcp-Method": "tools/list"})
+    expect(st == 400 and json.loads(body)["error"]["code"] == -32020, f"a wrong Mcp-Method: {st}")
+    st, _, body = post(port, ping, {"MCP-Protocol-Version": None})
+    expect(st == 400 and json.loads(body)["error"]["code"] == -32020, f"no version header: {st}")
+    call = {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "echo", "arguments": {"text": "x"}, "_meta": META}}
+    st, _, body = post(port, call, {"Mcp-Name": "shell"})
+    expect(st == 400 and "Mcp-Name" in body, f"a wrong Mcp-Name: {st}")
+    st, _, body = post(port, call, {"Mcp-Name": "=?base64?ZWNobw==?="})
+    expect(st == 200 and '"text":"x"' in body, f"Mcp-Name in its base64 form: {st} {body[-40:]!r}")
+    init = {"jsonrpc": "2.0", "id": 3, "method": "initialize",
+            "params": {"protocolVersion": "2025-11-25", "capabilities": {}}}
+    st, _, body = post(port, init)
+    expect(st == 400 and json.loads(body)["error"]["code"] == -32602,
+           f"the handshake era is refused over HTTP: {st}")
+    st, _, body = post(port, b"{nope")
+    expect(st == 400 and json.loads(body)["error"]["code"] == -32700, f"a parse error: {st}")
+    st, _, body = post(port, b"x" * 20000)
+    expect(st == 413, f"a body past the in buffer is 413 ({st})")
+    unknown = {"jsonrpc": "2.0", "id": 4, "method": "no/such", "params": {"_meta": META}}
+    st, _, body = post(port, unknown)
+    expect(st == 404 and json.loads(body)["error"]["code"] == -32601, f"an unknown method: {st}")
+    # Two requests on one kept-alive connection.
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    hs = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+          "MCP-Protocol-Version": "2026-07-28", "Mcp-Method": "ping"}
+    ok = True
+    for n in range(2):
+        c.request("POST", "/mcp", body=json.dumps(ping).encode(), headers=hs)
+        r = c.getresponse()
+        ok = ok and r.status == 200 and json.loads(r.read())["id"] == 1
+    c.close()
+    expect(ok, "two requests on one connection")
+
+
+async def run_http(mode, exe):
+    print(f"mode http {mode}")
+    with tempfile.TemporaryDirectory() as dirpath:
+        with open(os.path.join(dirpath, "a.txt"), "w") as f:
+            f.write("one\ntwo\nthree\n")
+        with open(os.path.join(dirpath, "b.txt"), "w") as f:
+            f.write("bravo")
+        with open(os.path.join(dirpath, "prompt.greet"), "w") as f:
+            f.write("Greet a person\nSay hello to {{who}} in {{lang}}.\n")
+        proc = subprocess.Popen([exe, "--dir", dirpath, "--http", "0"],
+                                stderr=subprocess.PIPE)
+        port = int(proc.stderr.readline().split()[1])
+        try:
+            http_wire(port)
+            client = create_mcp_http_client(headers={"Authorization": f"Bearer {TOKEN}"})
+            async with client:
+                transport = streamable_http_client(f"http://127.0.0.1:{port}/mcp",
+                                                   http_client=client)
+                async with Client(transport, mode=mode, read_timeout_seconds=10, cache=None,
+                                  elicitation_callback=on_elicit,
+                                  client_info=types.Implementation(name="conformance",
+                                                                   version="1")) as c:
+                    expect(c.protocol_version == "2026-07-28",
+                           f"protocol version over HTTP {c.protocol_version}")
+                    await common(c, mode, dirpath)
+                    r = await c.call_tool("bearer", {})
+                    expect(text_of(r) == TOKEN, f"the bearer token reaches the host: {text_of(r)!r}")
+                    await later(c)
+                    await large_and_binary(c, dirpath)
+                    await modern_subscriptions(c, dirpath)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+
 async def run(mode, exe):
     print(f"mode {mode}")
     with tempfile.TemporaryDirectory() as dirpath:
@@ -381,6 +491,8 @@ async def run(mode, exe):
 async def main(exe):
     for mode in ("2026-07-28", "auto", "legacy"):
         await run(mode, exe)
+    for mode in ("2026-07-28", "auto"):
+        await run_http(mode, exe)
     print(f"{checks} checks, {failures} failures")
     return 1 if failures else 0
 

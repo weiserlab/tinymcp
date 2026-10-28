@@ -1,5 +1,5 @@
 /*
- * tinymcp v0.7
+ * tinymcp v0.8
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
@@ -8,8 +8,8 @@
  * test_tinymcp.c - the protocol against a fake host: both eras, every
  * method, every error code, the buffers' edges, subscriptions and their
  * eviction, prompts and completion, calls answered later, streamed,
- * binary and structured content.  Each check is known to fail on a mutant
- * (tests/mutants.sh).
+ * binary and structured content, Streamable HTTP.  Each check is known to
+ * fail on a mutant (tests/mutants.sh).
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "tinymcp.h"
+#include "tinymcp_http.h"
 
 /* The fake host */
 
@@ -1875,6 +1876,367 @@ static void streaming(void)
                  "\"message\":\"reply does not fit the out buffer\"}}");
 }
 
+/* Streamable HTTP over a fake connection */
+
+static tinymcp_http_t hh;
+static char wire[65536];          /* every byte written to the connection */
+static size_t wire_len;
+static int marks;                 /* end-of-response marks */
+static char hin[2048], hout[4096];
+static size_t req_len;            /* the last request http_req() built */
+
+#define PREFIX(lit) (!strncmp(wire, lit, sizeof lit - 1))
+#define JSON_HEAD "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+
+static int wire_write(void *ctx, const char *bytes, size_t n)
+{
+    (void)ctx;
+    if (!bytes) {
+        marks++;
+        return 0;
+    }
+    if (wire_len + n < sizeof wire) {
+        memcpy(wire + wire_len, bytes, n);
+        wire_len += n;
+        wire[wire_len] = 0;
+    }
+    return 0;
+}
+
+static int http_send(void *ctx, const char *msg, size_t len)
+{
+    (void)ctx;
+    return tinymcp_http_send(&hh, msg, len);
+}
+
+static int http_part(void *ctx, const char *bytes, size_t len, int last)
+{
+    (void)ctx;
+    return tinymcp_http_send_part(&hh, bytes, len, last);
+}
+
+static const tinymcp_tool_t http_tools[] = {
+    { "echo", NULL, "{\"type\":\"object\"}", NULL },
+    { "slow", NULL, "{\"type\":\"object\"}", NULL },
+    { "long", NULL, "{\"type\":\"object\"}", NULL },
+};
+
+static const tinymcp_host_t host_http = {
+    "fake", "9.9", NULL, http_tools, 3, templates, 2,
+    fake_list, fake_read, fake_tool, fake_watch, fake_unwatch, http_send,
+    NULL, NULL, NULL, NULL, fake_cancel, NULL
+};
+
+static const tinymcp_host_t host_http_parts = {
+    "fake", "9.9", NULL, http_tools, 3, templates, 2,
+    fake_list, fake_read, fake_tool, fake_watch, fake_unwatch, http_send,
+    NULL, NULL, NULL, NULL, fake_cancel, http_part
+};
+
+static void http_reset(const tinymcp_host_t *h, size_t out_cap)
+{
+    tinymcp_init(&t, h, NULL, hin, sizeof hin, hout, out_cap, 4);
+    tinymcp_http_init(&hh, &t, "/mcp", wire_write, NULL);
+    touch_target = &t;
+    wire_len = 0;
+    wire[0] = 0;
+    marks = 0;
+}
+
+#define HMETA "\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":" \
+    "\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{}}"
+#define HHEAD(method) "POST /mcp HTTP/1.1\r\nHost: b\r\n" \
+    "Content-Type: application/json\r\n" \
+    "Accept: application/json, text/event-stream\r\n" \
+    "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: " method "\r\n"
+
+/* Feed a request with its Content-Length filled in; the bytes taken. */
+static size_t http_req(const char *head, const char *body, int bytewise)
+{
+    char req[4096];
+    size_t n, i, taken = 0;
+
+    n = (size_t)snprintf(req, sizeof req, "%sContent-Length: %u\r\n\r\n%s",
+                         head, (unsigned)strlen(body), body);
+    req_len = n;
+    if (!bytewise)
+        return tinymcp_http_feed(&hh, req, n);
+    for (i = 0; i < n; i++)
+        taken += tinymcp_http_feed(&hh, req + i, 1);
+    return taken;
+}
+
+/* The chunked body after the headers at wire[from], joined; -1 if broken. */
+static long dechunk(size_t from, char *out, size_t cap)
+{
+    const char *p = strstr(wire + from, "\r\n\r\n");
+    size_t o = 0;
+
+    if (!p)
+        return -1;
+    p += 4;
+    for (;;) {
+        char *e;
+        unsigned long n = strtoul(p, &e, 16);
+
+        if (e == p || e[0] != '\r' || e[1] != '\n')
+            return -1;
+        p = e + 2;
+        if (!n)
+            return strncmp(p, "\r\n", 2) ? -1 : (long)o;
+        if (o + n >= cap || p[n] != '\r' || p[n + 1] != '\n')
+            return -1;
+        memcpy(out + o, p, n);
+        o += n;
+        out[o] = 0;
+        p += n + 2;
+    }
+}
+
+static void http_basics(void)
+{
+    const char *call = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+                       "\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":\"hi\"},"
+                       HMETA "}}";
+    const char *ping = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\",\"params\":{"
+                       HMETA "}}";
+    char head[512];
+    const char *body;
+
+    http_reset(&host_http, sizeof hout);
+    CHECK(http_req(HHEAD("tools/call") "Mcp-Name: echo\r\n", call, 1) == req_len);
+    CHECK(PREFIX(JSON_HEAD "Content-Length: "));
+    body = strstr(wire, "\r\n\r\n");
+    CHECK(body && (size_t)atoi(wire + sizeof JSON_HEAD "Content-Length: " - 1) ==
+                  strlen(body + 4));
+    CONTAINS(wire, "\"text\":\"hi\"}]");
+    CHECK(hh.state == TINYMCP_HTTP_S_LINE && marks == 1);
+    /* Kept alive: the next request on the same connection. */
+    wire_len = 0;
+    http_req(HHEAD("ping"), ping, 0);
+    CONTAINS(wire, "200 OK");
+    CONTAINS(wire, "\"id\":7,\"result\"");
+    /* A notification is accepted and dropped. */
+    wire_len = 0;
+    http_req(HHEAD("notifications/cancelled"),
+             "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\"}", 0);
+    SAME(wire, "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n");
+    /* Refusals before the body read past it, and the next request works. */
+    wire_len = 0;
+    http_req("GET /mcp HTTP/1.1\r\n", "abcde", 1);
+    SAME(wire, "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n"
+               "Allow: POST\r\n\r\n");
+    CHECK(hh.state == TINYMCP_HTTP_S_LINE);
+    wire_len = 0;
+    http_req(HHEAD("ping"), ping, 0);
+    CONTAINS(wire, "\"id\":7,\"result\"");
+    wire_len = 0;
+    http_req("POST /other HTTP/1.1\r\n", "x", 0);
+    CONTAINS(wire, "HTTP/1.1 404 Not Found\r\n");
+    wire_len = 0;
+    http_req(HHEAD("ping") "Origin: http://evil\r\n", ping, 0);
+    CONTAINS(wire, "HTTP/1.1 403 Forbidden\r\n");
+    {
+        static const char *const ok[] = { "http://ok", NULL };
+
+        hh.origins = ok;
+        wire_len = 0;
+        http_req(HHEAD("ping") "Origin: http://ok\r\n", ping, 0);
+        CONTAINS(wire, "200 OK");
+        hh.origins = NULL;
+    }
+    wire_len = 0;
+    http_req("POST /mcp HTTP/1.1\r\nContent-Type: application/json\r\n"
+             "Accept: application/json\r\n", ping, 0);
+    CONTAINS(wire, "HTTP/1.1 406 Not Acceptable\r\n");
+    wire_len = 0;
+    http_req("POST /mcp HTTP/1.1\r\nContent-Type: text/plain\r\n"
+             "Accept: */*\r\n", ping, 0);
+    CONTAINS(wire, "HTTP/1.1 415 Unsupported Media Type\r\n");
+    /* A body larger than the in buffer: 413, the connection kept. */
+    {
+        static char big[3000];
+
+        memset(big, 'x', sizeof big - 1);
+        wire_len = 0;
+        http_req(HHEAD("ping"), big, 0);
+        CONTAINS(wire, "HTTP/1.1 413 Content Too Large\r\n");
+        CHECK(hh.state == TINYMCP_HTTP_S_LINE);
+        /* Exactly the in buffer leaves no room for its terminator. */
+        big[sizeof hin] = 0;
+        wire_len = 0;
+        http_req(HHEAD("ping"), big, 0);
+        CONTAINS(wire, "413");
+        big[sizeof hin] = 'x';
+    }
+    /* No length: 411 and the connection closes. */
+    wire_len = 0;
+    tinymcp_http_feed(&hh, "POST /mcp HTTP/1.1\r\n\r\n", 22);
+    CONTAINS(wire, "HTTP/1.1 411 Length Required\r\n");
+    CONTAINS(wire, "Connection: close\r\n");
+    CHECK(hh.state == TINYMCP_HTTP_S_CLOSE);
+    CHECK(tinymcp_http_feed(&hh, "x", 1) == 0);
+    http_reset(&host_http, sizeof hout);
+    tinymcp_http_feed(&hh, "POST /mcp HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+                      54);
+    CONTAINS(wire, "411");
+    CHECK(hh.state == TINYMCP_HTTP_S_CLOSE);
+    /* A line past the buffer, a bad request line, HTTP/1.0. */
+    http_reset(&host_http, sizeof hout);
+    snprintf(head, sizeof head, "POST /mcp HTTP/1.1\r\nX-Long: %0300d\r\n", 0);
+    http_req(head, ping, 0);
+    CONTAINS(wire, "431 Request Header Fields Too Large");
+    CHECK(hh.state == TINYMCP_HTTP_S_CLOSE);
+    http_reset(&host_http, sizeof hout);
+    tinymcp_http_feed(&hh, "\r\nGARBAGE\r\n\r\n", 15);
+    CONTAINS(wire, "HTTP/1.1 400 Bad Request\r\n");
+    CHECK(hh.state == TINYMCP_HTTP_S_CLOSE);
+    http_reset(&host_http, sizeof hout);
+    http_req("POST /mcp HTTP/1.0\r\nContent-Type: application/json\r\n"
+             "Accept: application/json, text/event-stream\r\n"
+             "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: ping\r\n", ping, 0);
+    CONTAINS(wire, "200 OK\r\nContent-Type: application/json\r\n");
+    CONTAINS(wire, "Connection: close\r\n");
+    CHECK(hh.state == TINYMCP_HTTP_S_CLOSE);
+}
+
+static void http_rules(void)
+{
+    const char *call = "{\"jsonrpc\":\"2.0\",\"id\":\"c\",\"method\":\"tools/call\","
+                       "\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":\"x\"},"
+                       HMETA "}}";
+    const char *read = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/read\","
+                       "\"params\":{\"uri\":\"test:///b\"," HMETA "}}";
+    const char *ping = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\",\"params\":{"
+                       HMETA "}}";
+
+    http_reset(&host_http, sizeof hout);
+    http_req(HHEAD("tools/call") "Mcp-Name: shell\r\n", call, 0);
+    CONTAINS(wire, "400 Bad Request");
+    CONTAINS(wire, "{\"jsonrpc\":\"2.0\",\"id\":\"c\",\"error\":{\"code\":-32020,");
+    wire_len = 0;
+    http_req(HHEAD("tools/call") "Mcp-Name: =?base64?ZWNobw==?=\r\n", call, 0);
+    CONTAINS(wire, "200 OK");
+    CONTAINS(wire, "\"text\":\"x\"}]");
+    wire_len = 0;
+    http_req(HHEAD("tools/call") "Mcp-Name: =?base64?!!!?=\r\n", call, 0);
+    CONTAINS(wire, "-32020");
+    wire_len = 0;
+    http_req(HHEAD("resources/read") "Mcp-Name: test:///b\r\n", read, 0);
+    CONTAINS(wire, "\"text\":\"bravo\"");
+    wire_len = 0;
+    http_req(HHEAD("resources/read") "Mcp-Name: test:///a\r\n", read, 0);
+    CONTAINS(wire, "-32020");
+    wire_len = 0;
+    http_req(HHEAD("tools/list"), ping, 0);
+    CONTAINS(wire, "Mcp-Method does not match");
+    wire_len = 0;
+    http_req("POST /mcp HTTP/1.1\r\nContent-Type: application/json\r\n"
+             "Accept: */*\r\nMcp-Method: ping\r\n", ping, 0);
+    CONTAINS(wire, "MCP-Protocol-Version does not match");
+    wire_len = 0;
+    http_req(HHEAD("ping") "Mcp-Method: ping\r\n", ping, 0);
+    CONTAINS(wire, "appears more than once");
+    wire_len = 0;
+    http_req(HHEAD("initialize"), "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":"
+             "\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\"}}", 0);
+    CONTAINS(wire, "400 Bad Request");
+    CONTAINS(wire, "\"id\":3,\"error\":{\"code\":-32602,");
+    CHECK(t.era != TINYMCP_ERA_LEGACY);
+    wire_len = 0;
+    http_req(HHEAD("ping"), "{x", 0);
+    CONTAINS(wire, "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,");
+    wire_len = 0;
+    http_req(HHEAD("ping"), "[1]", 0);
+    CONTAINS(wire, "-32700");
+    wire_len = 0;
+    http_req(HHEAD("ping"), "{\"id\":1}", 0);
+    CONTAINS(wire, "-32600");
+    /* The server's own errors keep their status. */
+    wire_len = 0;
+    http_req(HHEAD("no/such"), "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"no/such\","
+             "\"params\":{" HMETA "}}", 0);
+    CONTAINS(wire, "HTTP/1.1 404 Not Found\r\n");
+    wire_len = 0;
+    http_req(HHEAD("tools/call") "Mcp-Name: nope\r\n",
+             "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"nope\"," HMETA "}}", 0);
+    CONTAINS(wire, "HTTP/1.1 400 Bad Request\r\n");
+    wire_len = 0;
+    http_req(HHEAD("tools/call") "Mcp-Name: echo\r\n",
+             "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"echo\",\"arguments\":{}," HMETA "}}", 0);
+    CONTAINS(wire, "HTTP/1.1 400 Bad Request\r\n");
+    /* The bearer token, kept while the request is served. */
+    wire_len = 0;
+    http_req(HHEAD("ping") "Authorization: Bearer s3cret\r\n", ping, 0);
+    SAME(tinymcp_http_bearer(&hh), "s3cret");
+    http_req(HHEAD("ping") "Authorization: Basic abc\r\n", ping, 0);
+    SAME(tinymcp_http_bearer(&hh), "");
+    CHECK(tinymcp_http_send(&hh, "{}", 2) == -1);
+}
+
+static void http_streams(void)
+{
+    const char *slow = "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\","
+                       "\"params\":{\"name\":\"slow\",\"_meta\":{\"progressToken\":1,"
+                       "\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\","
+                       "\"io.modelcontextprotocol/clientCapabilities\":{}}}}";
+    const char *ping = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\",\"params\":{"
+                       HMETA "}}";
+    tinymcp_sink_t text;
+    static char body[32768];
+    char req[1024];
+    size_t n;
+    long got;
+    int i;
+
+    /* A kept call: progress commits an event stream; the result ends it. */
+    http_reset(&host_http, sizeof hout);
+    n = (size_t)snprintf(req, sizeof req, "%sMcp-Name: slow\r\nContent-Length: %u"
+                         "\r\n\r\n%sPOST", HHEAD("tools/call"),
+                         (unsigned)strlen(slow), slow);
+    CHECK(tinymcp_http_feed(&hh, req, n) == n - 4);
+    CHECK(wire_len == 0 && hh.state == TINYMCP_HTTP_S_OWED);
+    CHECK(tinymcp_progress(&t, kept, 1, 2, "one") == 0);
+    CHECK(PREFIX("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                 "Transfer-Encoding: chunked\r\nCache-Control: no-cache\r\n\r\n"));
+    CHECK(marks == 1);
+    CHECK(tinymcp_result_begin(&t, kept, &text) == 0);
+    tinymcp_sink_puts(&text, "done");
+    tinymcp_result_end(&t, kept, &text, 0);
+    got = dechunk(0, body, sizeof body);
+    CHECK(got > 0 && !strncmp(body, "event: message\r\ndata: {\"jsonrpc\":\"2.0\","
+                                    "\"method\":\"notifications/progress\"", 70));
+    CONTAINS(body, "\r\n\r\nevent: message\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":9,");
+    CHECK(got > 4 && !strcmp(body + got - 4, "\r\n\r\n"));
+    CHECK(hh.state == TINYMCP_HTTP_S_LINE);
+    /* The bytes left over are the next request. */
+    wire_len = 0;
+    http_req(HHEAD("ping"), ping, 0);
+    CONTAINS(wire, "\"id\":7,\"result\"");
+    /* Kept with no progress: the result is plain JSON. */
+    wire_len = 0;
+    http_req(HHEAD("tools/call") "Mcp-Name: slow\r\n", slow, 0);
+    tinymcp_result_begin(&t, kept, &text);
+    tinymcp_sink_puts(&text, "quiet");
+    tinymcp_result_end(&t, kept, &text, 0);
+    CHECK(PREFIX(JSON_HEAD "Content-Length: "));
+    CONTAINS(wire, "\"text\":\"quiet\"}]");
+    /* A reply past the out buffer goes in chunks. */
+    http_reset(&host_http_parts, 512);
+    http_req(HHEAD("tools/call") "Mcp-Name: long\r\n",
+             "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"long\"," HMETA "}}", 0);
+    CHECK(PREFIX(JSON_HEAD "Transfer-Encoding: chunked\r\n\r\n"));
+    got = dechunk(0, body, sizeof body);
+    CHECK(got > 20000 && !strncmp(body, "{\"jsonrpc\":\"2.0\",\"id\":8,", 24) &&
+          !strcmp(body + got - 7, "yy\"}]}}"));
+    for (i = 0; i < 3; i++)
+        tinymcp_http_feed(&hh, "", 0);
+    CHECK(hh.state == TINYMCP_HTTP_S_LINE);
+}
+
 int main(void)
 {
     json_edges();
@@ -1900,6 +2262,9 @@ int main(void)
     content_kinds();
     streaming();
     meta_members();
+    http_basics();
+    http_rules();
+    http_streams();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

@@ -1,5 +1,5 @@
 #
-# tinymcp v0.7
+# tinymcp v0.8
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
@@ -20,8 +20,8 @@ CFLAGS  ?= -std=c99 -Wall -Wextra -Wpedantic -Wshadow -Wconversion \
 CFLAGS  += -I.
 SANFLAGS = -fsanitize=address,undefined -fno-omit-frame-pointer
 
-LIB_SRCS = tinymcp.c tinymcp_json.c
-HDRS     = tinymcp.h tinymcp_json.h
+LIB_SRCS = tinymcp.c tinymcp_json.c tinymcp_http.c
+HDRS     = tinymcp.h tinymcp_json.h tinymcp_http.h
 
 all: build/tinymcp_posix
 
@@ -31,8 +31,10 @@ build:
 build/%.o: %.c $(HDRS) | build
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-build/tinymcp_posix: examples/posix/tinymcp_posix.c build/tinymcp.o build/tinymcp_json.o $(HDRS)
-	$(CC) $(CFLAGS) -D_POSIX_C_SOURCE=200809L -o $@ $< build/tinymcp.o build/tinymcp_json.o
+LIB_OBJS = build/tinymcp.o build/tinymcp_json.o build/tinymcp_http.o
+
+build/tinymcp_posix: examples/posix/tinymcp_posix.c $(LIB_OBJS) $(HDRS)
+	$(CC) $(CFLAGS) -D_POSIX_C_SOURCE=200809L -o $@ $< $(LIB_OBJS)
 
 build/test_tinymcp: tests/test_tinymcp.c $(LIB_SRCS) $(HDRS) | build
 	$(CC) $(CFLAGS) $(SANFLAGS) -o $@ $< $(LIB_SRCS)
@@ -69,7 +71,10 @@ size: | build
 	    -fdata-sections -I. -c tinymcp.c -o build/tinymcp.m33.o
 	$(ARMCC) -std=c99 -Os -mcpu=cortex-m33 -mthumb -ffunction-sections \
 	    -fdata-sections -I. -c tinymcp_json.c -o build/tinymcp_json.m33.o
-	$(ARMCC:gcc=size) build/tinymcp.m33.o build/tinymcp_json.m33.o
+	$(ARMCC) -std=c99 -Os -mcpu=cortex-m33 -mthumb -ffunction-sections \
+	    -fdata-sections -I. -c tinymcp_http.c -o build/tinymcp_http.m33.o
+	$(ARMCC:gcc=size) build/tinymcp.m33.o build/tinymcp_json.m33.o \
+	    build/tinymcp_http.m33.o
 
 # Comment and prose style, over the files git tracks: stage new ones first.
 lint:
