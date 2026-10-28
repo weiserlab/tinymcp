@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# tinymcp v0.4
+# tinymcp v0.5
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #

@@ -1,5 +1,5 @@
 /*
- * tinymcp v0.4
+ * tinymcp v0.5
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
@@ -24,8 +24,8 @@
 extern "C" {
 #endif
 
-#define TINYMCP_VERSION  "0.4.0"
-#define TINYMCP_API      2             /* bumped on any change to tinymcp_host_t */
+#define TINYMCP_VERSION  "0.5.0"
+#define TINYMCP_API      3             /* bumped on any change to tinymcp_host_t */
 #define TINYMCP_PROTOCOL "2026-07-28"  /* the newest revision served */
 
 #ifndef TINYMCP_SUBS_MAX
@@ -43,6 +43,9 @@ extern "C" {
 #ifndef TINYMCP_ARGS_MAX
 #define TINYMCP_ARGS_MAX 8    /* tool or prompt arguments kept; later ones are dropped */
 #endif
+#ifndef TINYMCP_LATER_MAX
+#define TINYMCP_LATER_MAX 2   /* tool calls kept open at once (tinymcp_defer) */
+#endif
 #define TINYMCP_COMPLETE_MAX 100   /* completion values in one reply, the spec's cap */
 
 /* What a host function returns. */
@@ -50,6 +53,8 @@ extern "C" {
 #define TINYMCP_TOOL_ERROR  1     /* tool_call: the text is the error, isError true */
 #define TINYMCP_NEED_INPUT  2     /* tool_call, resource_read, prompt_get: send the
                                      elicitation tinymcp_elicit() set instead */
+#define TINYMCP_LATER       3     /* tool_call: tinymcp_defer() kept the call, and
+                                     its result is sent later */
 #define TINYMCP_ENOENT    (-1)    /* no such resource */
 #define TINYMCP_EEFFECT   (-2)    /* reading would act; the client is told to use a tool */
 #define TINYMCP_EINVAL    (-3)    /* an argument is missing or wrong */
@@ -227,6 +232,12 @@ typedef struct tinymcp_host {
     int (*complete)(void *ctx, int is_prompt, const char *ref, const char *arg,
                     const char *value, const tinymcp_args_t *context,
                     tinymcp_completion_t *c);
+    /*
+     * The client cancelled the kept call (tinymcp_defer()); stop its work.
+     * The call is gone when this returns and no result is sent for it.
+     * May be NULL.
+     */
+    void (*cancel)(void *ctx, unsigned call);
 } tinymcp_host_t;
 
 #define TINYMCP_LC_RESOURCES 1u   /* listchanged: resources/list_changed */
@@ -240,7 +251,15 @@ typedef struct tinymcp_sub {
     unsigned char listchanged;   /* TINYMCP_LC_* bits */
 } tinymcp_sub_t;
 
-/** One server instance: one stream, one request in flight. */
+/** A tool call kept open: its id and progress token as the client sent them. */
+typedef struct tinymcp_later {
+    char id[TINYMCP_ID_MAX];
+    char token[TINYMCP_ID_MAX];  /* _meta.progressToken; empty: none */
+    unsigned char modern;
+    unsigned char used;
+} tinymcp_later_t;
+
+/** One server instance: one stream, one request handled at a time. */
 typedef struct tinymcp {
     const tinymcp_host_t *host;
     void *ctx;
@@ -263,6 +282,14 @@ typedef struct tinymcp {
     const char *el_message;
     const char *el_schema;
     const char *el_state;
+    tinymcp_jv_t cur_id;        /* the request being handled, its id */
+    tinymcp_jv_t cur_token;     /* and its _meta.progressToken, or J_NONE */
+    unsigned char cur_modern;
+    unsigned char in_call;      /* inside tool_call: tinymcp_defer() may keep it */
+    unsigned char deferred;     /* the handle tinymcp_defer() gave this call, or 0 */
+    tinymcp_later_t later[TINYMCP_LATER_MAX];
+    unsigned char later_open;   /* the call whose result is being written, or 0 */
+    tinymcp_jw_t later_w;
     unsigned char busy;         /* inside a request: notifications wait */
     unsigned pending;           /* slots whose update waits, one bit each */
     unsigned char pending_lc;   /* TINYMCP_LC_* notices that wait */
@@ -358,6 +385,36 @@ int tinymcp_input_bool(const tinymcp_t *t, const char *key, const char *field);
  * @return its length, or -1 when it is absent or does not fit cap - 1.
  */
 int tinymcp_request_state(const tinymcp_t *t, char *buf, size_t cap);
+
+/*
+ * Answering later: a tool whose work outlasts the request calls
+ * tinymcp_defer() and returns TINYMCP_LATER.  The library keeps the call's
+ * id and progress token; the host reports progress, then writes the result
+ * between tinymcp_result_begin() and tinymcp_result_end().  None of these
+ * may be called from inside a host function: they return -1 there.
+ */
+
+/** Inside tool_call: keep this call open.  Its handle, 1 or more, or 0
+ *  when TINYMCP_LATER_MAX calls are kept or its id does not fit. */
+unsigned tinymcp_defer(tinymcp_t *t);
+
+/**
+ * notifications/progress for a kept call: done so far of total (0 when
+ * unknown), message NULL for none.
+ * @return 0 when sent; -1 for no such call, a call without a progress
+ *         token, or inside a host function.
+ */
+int tinymcp_progress(tinymcp_t *t, unsigned call, unsigned long done,
+                     unsigned long total, const char *message);
+
+/** Open the kept call's result, text content into text.
+ *  @return 0, or -1 for no such call or inside a host function. */
+int tinymcp_result_begin(tinymcp_t *t, unsigned call, tinymcp_sink_t *text);
+
+/** Send the result tinymcp_result_begin() opened, with that sink; the call
+ *  is then gone.  isError is true for is_error or for text that was cut. */
+void tinymcp_result_end(tinymcp_t *t, unsigned call,
+                        const tinymcp_sink_t *text, int is_error);
 
 #ifdef __cplusplus
 }

@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 #
-# tinymcp v0.4
+# tinymcp v0.5
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
 # Authors: Ambuj Varshney <ambuj@tiku-os.org>
 #
 # board_smoke.py - the official mcp SDK client against a tikuOS board
-# through the bridge: discover, list, read a node, write the LED, subscribe
-# and see the change, run a shell line, get a prompt the board holds,
-# complete a path, hear the board ask and answer it, and ask the owner
-# before a reboot or a clock change, through a form or a token.  Both eras.  Every check prints one
-# "CHECK <era> <key> ok|fail <detail>" line, which TikuBench's suite reads.
+# through the bridge, in both eras: the tools, resources, prompts, asks,
+# the owner's consent and BASIC jobs, one "CHECK <era> <key> ok|fail
+# <detail>" line per check, which TikuBench's tinymcp suite reads.
 #
 # SPDX-License-Identifier: Apache-2.0
 
@@ -34,7 +32,9 @@ KEYS = ["protocol", "identity", "tools", "read", "read-tool", "list",
         "prompts", "prompt-get", "prompt-missing", "prompts-changed",
         "complete", "complete-root", "ask-heard", "answer", "answer-stale",
         "journal", "consent-no", "consent-yes", "consent-hidden",
-        "consent-journal"]
+        "consent-journal", "job-run", "job-progress", "job-meanwhile", "job-background",
+        "job-one", "job-stop", "job-cancel", "job-budget", "job-confined",
+        "job-journal"]
 CLIENT = "board-smoke"
 
 PROMPT = "/data/prompt.smoke"
@@ -88,7 +88,9 @@ async def run(mode, port):
                f"{si.version if si else None!r}; board name {name!r}")
         tools = await c.list_tools()
         names = sorted(t.name for t in tools.tools)
-        expect("tools", names == ["ls", "read", "shell", "write"], f"tools {names}")
+        expect("tools", names in (["ls", "read", "shell", "write"],
+                                  ["basic", "ls", "read", "shell", "write"]),
+               f"tools {names}")
 
         r = await c.read_resource("tiku:///sys/uptime")
         expect("read", r.contents[0].text.strip().isdigit(), f"uptime {r.contents[0].text.strip()!r}")
@@ -144,6 +146,12 @@ async def run(mode, port):
         await completion(c)
         await asks(c, mode, seen)
         await consent(c, mode)
+        if "basic" in names:
+            await jobs(c)
+        else:
+            for k in KEYS:
+                if k.startswith("job-"):
+                    expect(k, False, "the board has no basic tool")
         r = await c.call_tool("shell", {"line": "mcp"})
         status = text_of(r).strip().replace("\n", " | ")
         expect("status", "tinymcp" in status and "requests" in status, status)
@@ -249,6 +257,119 @@ async def consent(c, mode):
     expect("consent-journal", f"{CLIENT} allowed: change the CPU clock" in j and
            f"{CLIENT} asked consent: reboot the board" in j,
            " | ".join(j.splitlines()[-4:]))
+
+
+async def node(c, path):
+    return (await c.read_resource("tiku://" + path)).contents[0].text.strip()
+
+
+async def job_ends(c, seconds):
+    """The job's state once it is no longer running, or "running"."""
+    state = "running"
+    with anyio.move_on_after(seconds):
+        while state == "running":
+            await anyio.sleep(0.3)
+            state = await node(c, "/sys/mcp/job/state")
+    return state
+
+
+COUNT = ('10 FOR I = 1 TO 4\n20 PRINT "LINE" + STR$(I)\n30 DELAY 400\n'
+         '40 NEXT I\n50 PRINT "END"\n')
+
+
+async def jobs(c):
+    """BASIC programs as the board's job, waited for and in the background."""
+    notes = []
+
+    async def on_progress(progress, total, message):
+        notes.append((progress, message))
+
+    r = await c.call_tool("basic", {"program": COUNT}, progress_callback=on_progress)
+    out = text_of(r)
+    expect("job-run", not r.is_error and "LINE4" in out and out.rstrip().endswith("END"),
+           f"{out.strip()!r}")
+    expect("job-progress", len(notes) >= 2 and all(m and m.startswith("LINE") for _, m in notes)
+           and [p for p, _ in notes] == sorted(p for p, _ in notes),
+           f"progress {notes}")
+
+    # While the call waits, the board answers other requests.
+    got = {}
+
+    async def waited():
+        got["out"] = text_of(await c.call_tool("basic", {"program": COUNT}))
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(waited)
+        await anyio.sleep(0.6)
+        got["state"] = await node(c, "/sys/mcp/job/state")
+        got["read"] = text_of(await c.call_tool("read", {"path": "/sys/uptime"})).strip()
+        got["early"] = "out" not in got
+    expect("job-meanwhile", got["early"] and got["state"] == "running" and
+           got["read"].isdigit() and "END" in got.get("out", ""),
+           f"{got}")
+
+    # In the background: the call answers at once, other reads go on, the
+    # output and the end are nodes; a second job is refused while it runs.
+    r = await c.call_tool("basic", {"program": COUNT, "background": True})
+    started = text_of(r)
+    seq = await node(c, "/sys/mcp/job/seq")
+    up = await uptime(c)
+    running = await node(c, "/sys/mcp/job/state")
+    second = await c.call_tool("basic", {"program": "10 END\n"})
+    state = await job_ends(c, 10)
+    out = await node(c, "/sys/mcp/job/out")
+    expect("job-background", not r.is_error and f"job #{seq} runs" in started and
+           up >= 0 and running == "running" and state == "done" and "LINE4" in out and
+           await node(c, "/sys/mcp/job/by") == CLIENT,
+           f"{started[:30]!r}; {running} -> {state}; out {out[-20:]!r}")
+    expect("job-one", second.is_error and "is running" in text_of(second),
+           f"{text_of(second)[:60]!r}")
+
+    # Stopped through its node; cancelled by the client; past its seconds.
+    await c.call_tool("basic", {"program": '10 PRINT "S"\n20 DELAY 100000\n',
+                                "background": True})
+    await anyio.sleep(0.5)
+    r = await c.call_tool("write", {"path": "/sys/mcp/job/stop", "value": "1"})
+    state = await job_ends(c, 3)
+    out = await node(c, "/sys/mcp/job/out")
+    again = await c.call_tool("write", {"path": "/sys/mcp/job/stop", "value": "1"})
+    expect("job-stop", not r.is_error and state == "stopped" and
+           "stopped at line 20" in out and again.is_error,
+           f"{state}; out {out!r}; again {text_of(again)!r}")
+
+    with anyio.move_on_after(1.5):
+        await c.call_tool("basic", {"program": "10 DELAY 100000\n"})
+    state = await job_ends(c, 3)
+    j = await node(c, "/sys/mcp/journal")
+    seq = await node(c, "/sys/mcp/job/seq")
+    expect("job-cancel", state == "stopped" and f"{CLIENT} job #{seq}: cancelled" in j,
+           f"{state}; journal {j.splitlines()[-1:]}")
+
+    r = await c.call_tool("basic", {"program": "10 DELAY 100000\n", "seconds": 2})
+    expect("job-budget", r.is_error and "2 s ran out" in text_of(r) and
+           await node(c, "/sys/mcp/job/state") == "stopped",
+           f"{text_of(r)[-60:]!r}")
+
+    # A job has no authority over the system's nodes and cannot reboot.
+    target = await node(c, "/sys/cpu/freq_target")
+    before = await uptime(c)
+    r1 = await c.call_tool("basic", {"program": f'10 VFSWRITE$ "/sys/cpu/freq_target", "{target}"\n'})
+    try:
+        r2 = await c.call_tool("basic", {"program": "10 REBOOT\n"})
+    except MCPError as e:
+        expect("job-confined", False, f"the board did not answer, so it rebooted: {e}")
+        return
+    await anyio.sleep(1.0)
+    after = await uptime(c)
+    expect("job-confined", r1.is_error and "EPERM" in text_of(r1) and r2.is_error and
+           "REBOOT is not allowed in a job" in text_of(r2) and after >= before,
+           f"{text_of(r1).strip()[-40:]!r}; {text_of(r2).strip()[-40:]!r}; "
+           f"uptime {before} -> {after}")
+
+    j = await node(c, "/sys/mcp/journal")
+    expect("job-journal", f"{CLIENT} job #" in j and ": started" in j and
+           "board job #" in j and ": done" in j and ": stopped" in j,
+           " | ".join(j.splitlines()[-5:]))
 
 
 QUESTION = "tiku:///sys/mcp/ask/question"

@@ -28,11 +28,11 @@ ports/                          what each host maps
 hygiene/                        the commit and style checks
 ```
 
-| Measured on 2026-10-27 | |
+| Measured on 2026-10-28 | |
 |---|---|
-| code, `-Os`, Cortex-M33 (`make size`) | 14.8 KB (`tinymcp.c` 12.7 KB, `tinymcp_json.c` 2.1 KB) |
-| code, `-Os`, Cortex-M0+ | 14.9 KB |
-| one instance, `tinymcp_t`, four subscription slots, Cortex-M33 | 692 bytes |
+| code, `-Os`, Cortex-M33 (`make size`) | 16.0 KB (`tinymcp.c` 13.9 KB, `tinymcp_json.c` 2.1 KB) |
+| code, `-Os`, Cortex-M0+ | 16.3 KB |
+| one instance, `tinymcp_t`, four subscription slots, two kept calls, Cortex-M33 | 868 bytes |
 | stack during a tool call | about 1 KB (the argument table) |
 | buffers | the host's: the in buffer holds one request, the out buffer one reply |
 
@@ -95,6 +95,17 @@ the form and sends the request again, and the host reads the answer with
 request can carry that: a client of the current revision that declared
 elicitation.
 
+A tool whose work outlasts the request calls `tinymcp_defer()` inside
+`tool_call` and returns `TINYMCP_LATER`.  The library keeps the call's id
+and its `_meta.progressToken`, up to `TINYMCP_LATER_MAX` (2) calls at once,
+and other requests are served meanwhile.  The host sends
+`notifications/progress` with `tinymcp_progress()` and finally writes the
+result between `tinymcp_result_begin()` and `tinymcp_result_end()`.  A
+`notifications/cancelled` naming the call reaches the host's `cancel`, and
+no result is sent for it; `tinymcp_closed()` cancels every kept call.
+These calls are made from outside the host functions, from the host's
+loop.
+
 `name`, `title` and `version` are the host's `serverInfo`; the library
 names itself in the `org.tinymcp/library` member of the `_meta` of the
 discover and initialize results.  `tinymcp_client()` is the name the
@@ -115,7 +126,8 @@ Output past the out buffer is cut, marked `[cut]`, and the result carries
 | `tools/list`, `tools/call` | both |
 | `resources/list`, `resources/templates/list`, `resources/read` | both |
 | `prompts/list`, `prompts/get`, `completion/complete` | both |
-| `subscriptions/listen`, `notifications/cancelled` | 2026-07-28 |
+| `subscriptions/listen` | 2026-07-28 |
+| `notifications/progress`, `notifications/cancelled` | both |
 | `resources/subscribe`, `resources/unsubscribe` | handshake eras |
 
 A request that carries `_meta.io.modelcontextprotocol/protocolVersion` is
@@ -179,8 +191,9 @@ make lint            # comment and prose style over the tracked files
 `make conformance` creates `.venv` with the `mcp` and `pyserial` packages
 on first use.  Each era of the conformance run lists, calls, reads, pages,
 subscribes and sees a change arrive from the example server, gets a
-prompt, completes a file name, hears the prompts change, and removes a
-file only after its elicitation callback says yes.
+prompt, completes a file name, hears the prompts change, removes a file
+only after its elicitation callback says yes, and follows the example's
+`count` tool: its progress, an echo answered while it counts, a cancel.
 
 ## Licence
 

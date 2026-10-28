@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# tinymcp v0.4
+# tinymcp v0.5
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
@@ -48,7 +48,7 @@ mutate result-type tinymcp.c 's/"resultType\\":\\"complete\\",\\"_meta/"resultTy
 mutate legacy-not-found tinymcp.c 's/return r->modern ? -32602 : -32002;/return -32602;/'
 mutate no-tail-reserve tinymcp.c 's/#define TAIL_RESERVE 80/#define TAIL_RESERVE 0/'
 mutate no-eviction tinymcp.c 's/while (needed \&\& slots_free(t) < needed)/while (0)/'
-mutate cancel-announces tinymcp.c 's/listen_end(r->t, id, 0);/listen_end(r->t, id, 1);/'
+mutate cancel-announces tinymcp.c 's/    listen_end(t, id, 0);/    listen_end(t, id, 1);/'
 mutate no-cut-marker tinymcp.c 's/tinymcp_jw_raw(w, "\\\\n\[cut\]");/tinymcp_jw_raw(w, "");/'
 mutate caps-unchecked tinymcp.c 's/if (tinymcp_json_get(&meta, META_CAPS, &v) != 1 ||/if (0 \&\& tinymcp_json_get(\&meta, META_CAPS, \&v) != 1 ||/'
 mutate version-unchecked tinymcp.c 's/if (!version_supported(&pv)) {/if (0) {/'
@@ -92,6 +92,26 @@ mutate state-no-decode tinymcp.c 's/    return tinymcp_json_decode(buf, t->in_st
 mutate decline-is-accept tinymcp.c 's/    if (tinymcp_json_is(\&action, "decline"))/    if (tinymcp_json_is(\&action, "accept"))/'
 mutate state-fits tinymcp.c 's/    if (t->in_state.type != TINYMCP_J_STRING || t->in_state.len + 1 > cap)/    if (t->in_state.type != TINYMCP_J_STRING || t->in_state.len > cap)/'
 mutate need-input-tool tinymcp.c '/rc = h->tool_call/,/host_failed/{s/    if (rc == TINYMCP_NEED_INPUT) {/    if (0) {/;}'
+
+mutate later-cancel-host tinymcp.c 's/    if (cancelled \&\& t->host->cancel)/    if (0)/'
+mutate later-cancel-match tinymcp.c 's/        if (t->later\[i\].used \&\& !strcmp(t->later\[i\].id, id)) {/        if (0) {/'
+mutate later-closed-silent tinymcp.c '/Nobody is left/,/later_drop/s/later_drop(t, i, 1)/later_drop(t, i, 0)/'
+mutate later-progress-inside tinymcp.c 's/    if (!l || !l->token\[0\] || t->busy)/    if (!l || !l->token[0])/'
+mutate later-begin-inside tinymcp.c '/^int tinymcp_result_begin/,/^}/s/    if (!l || t->busy)$/    if (!l)/'
+mutate later-total-always tinymcp.c 's/    if (total) {/    if (1) {/'
+mutate later-defer-outside tinymcp.c '/^unsigned tinymcp_defer/,/^}/s/    if (!t->in_call)$/    if (0)/'
+mutate later-defer-twice tinymcp.c '/^unsigned tinymcp_defer/,/^}/s/    if (t->deferred)$/    if (0)/'
+mutate later-unkept tinymcp.c 's/        if (!r->t->deferred)$/        if (0)/'
+mutate later-answered-now tinymcp.c '/Kept and answered now/,/memset/s/    if (r->t->deferred)$/    if (0)/'
+mutate later-era tinymcp.c 's/        l->modern = t->cur_modern;/        l->modern = 1;/'
+mutate later-no-token tinymcp.c 's/        t->cur_token = v;/        (void)v;/'
+mutate later-long-id tinymcp.c 's/        if (id_text(\&t->cur_id, l->id, sizeof l->id) != 0)/        if (0)/'
+mutate later-no-flush tinymcp.c '/^void tinymcp_result_end/,/^}/s/    flush_pending(t);/    ;/'
+mutate later-busy-stuck tinymcp.c '/^void tinymcp_result_end/,/^}/s/    t->busy = 0;/    ;/'
+mutate later-not-dropped tinymcp.c 's/    later_drop(t, call - 1, 0);/    ;/'
+mutate later-full tinymcp.c 's/    if (w->full) {/    if (0) {/'
+mutate later-end-unopened tinymcp.c 's/    if (!l || t->later_open != call)/    if (!l)/'
+mutate later-state-left tinymcp.c '/^out:$/,/busy = 0/s/    t->deferred = 0;/    ;/'
 
 echo "$total mutants, $survived survived"
 [ "$survived" -eq 0 ]

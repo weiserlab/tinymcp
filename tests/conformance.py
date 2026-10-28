@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# tinymcp v0.4
+# tinymcp v0.5
 # The Model Context Protocol server as a library any firmware can carry.
 # http://tinymcp.org
 #
@@ -9,7 +9,8 @@
 # conformance.py - the official mcp SDK client against the POSIX example in
 # every era it can speak: pinned 2026-07-28, auto-negotiated, and the
 # initialize handshake.  Each run lists, calls, reads, subscribes and sees a
-# change arrive, gets a prompt and completes a name.
+# change arrive, gets a prompt and completes a name, and follows a call the
+# server answers later: its progress, a call served meanwhile, a cancel.
 #
 # SPDX-License-Identifier: Apache-2.0
 
@@ -74,7 +75,7 @@ async def common(c, mode, dirpath):
 
     tools = await c.list_tools()
     names = sorted(t.name for t in tools.tools)
-    expect(names == ["echo", "remove", "shell", "whoami", "write"], f"tool names {names}")
+    expect(names == ["count", "counters", "echo", "remove", "shell", "whoami", "write"], f"tool names {names}")
     r = await c.call_tool("whoami", {})
     expect(text_of(r) == "conformance", f"the client's name {text_of(r)!r}")
     echo = next(t for t in tools.tools if t.name == "echo")
@@ -167,6 +168,46 @@ async def consent(c, legacy, dirpath):
            not os.path.exists(os.path.join(dirpath, "doomed.txt")),
            f"a yes deletes it: {text_of(r)!r}")
     os.remove(os.path.join(dirpath, "kept.txt"))
+
+
+async def later(c):
+    """count: a call kept open, its progress, other calls meanwhile, a cancel."""
+    seen = []
+
+    async def on_progress(progress, total, message):
+        seen.append((progress, total, message))
+
+    r = await c.call_tool("count", {"to": 5, "ms": 20}, progress_callback=on_progress)
+    expect(text_of(r) == "counted to 5" and not r.is_error, f"count result {text_of(r)!r}")
+    expect(seen == [(n, 5, str(n)) for n in range(1, 6)], f"progress {seen}")
+    r = await c.call_tool("count", {"to": 2, "ms": 5})
+    expect(text_of(r) == "counted to 2", f"a count without a progress token {text_of(r)!r}")
+
+    # Another call is answered while a count runs.
+    got = {}
+
+    async def slow():
+        got["slow"] = text_of(await c.call_tool("count", {"to": 10, "ms": 50}))
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(slow)
+        await anyio.sleep(0.15)
+        mid = text_of(await c.call_tool("counters", {}))
+        got["echo"] = text_of(await c.call_tool("echo", {"text": "meanwhile"}))
+        got["early"] = "slow" not in got
+    expect(got.get("echo") == "meanwhile" and got.get("early") and
+           mid.startswith("running 1 ") and got.get("slow") == "counted to 10",
+           f"served while counting: {got} {mid!r}")
+
+    # A cancelled call stops its count and gets no result.
+    before = text_of(await c.call_tool("counters", {}))
+    with anyio.move_on_after(0.2):
+        await c.call_tool("count", {"to": 1000, "ms": 10})
+    await anyio.sleep(0.1)
+    after = text_of(await c.call_tool("counters", {}))
+    n0 = int(before.split()[-1])
+    expect(after.startswith("running 0 ") and int(after.split()[-1]) == n0 + 1,
+           f"cancelled: {before!r} -> {after!r}")
 
 
 async def prompts_and_completion(c):
@@ -288,6 +329,7 @@ async def run(mode, exe):
             expect(c.protocol_version == want,
                    f"protocol version {c.protocol_version}, want {want}")
             await common(c, mode, dirpath)
+            await later(c)
             if mode == "legacy":
                 await legacy_subscriptions(c, seen)
             else:

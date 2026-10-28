@@ -1,5 +1,5 @@
 /*
- * tinymcp v0.4
+ * tinymcp v0.5
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
@@ -7,18 +7,21 @@
  *
  * tinymcp_posix.c - an MCP server over stdin and stdout that serves the
  * files of one directory as resources, its prompt.<name> files as prompts,
- * completes file names, and runs lines through the shell: the conformance
- * target, and the shape a binding takes on any host.
+ * completes file names, runs lines through the shell, and counts slowly
+ * in a call it answers later: the conformance target, and the shape a
+ * binding takes on any host.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <dirent.h>
 #include <errno.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "tinymcp.h"
@@ -164,7 +167,103 @@ static const tinymcp_tool_t tools[] = {
       "says yes.",
       "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},"
       "\"required\":[\"name\"]}" },
+    { "count", "Count from 1 to the number given, one every ms milliseconds "
+      "(100 when absent), with progress for each; the result comes at the "
+      "end.",
+      "{\"type\":\"object\",\"properties\":{\"to\":{\"type\":\"integer\"},"
+      "\"ms\":{\"type\":\"integer\"}},\"required\":[\"to\"]}" },
+    { "counters", "Return the counts running, finished and cancelled.",
+      "{\"type\":\"object\"}" },
 };
+
+/* The counts in progress, one per kept call. */
+static struct {
+    unsigned call;           /* 0: free */
+    long to, at, ms;
+    long long next;          /* when the next number is due, in ms */
+} counts[TINYMCP_LATER_MAX];
+static unsigned finished, cancelled;
+
+static long long now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* count: keeps the call and counts from the main loop. */
+static int count_start(const tinymcp_args_t *args, tinymcp_sink_t *text)
+{
+    long to = tinymcp_arg_int(args, "to", -1);
+    long ms = tinymcp_arg_int(args, "ms", 100);
+    unsigned i, call;
+
+    if (to < 0 || ms < 0)
+        return TINYMCP_EINVAL;
+    for (i = 0; i < TINYMCP_LATER_MAX && counts[i].call; i++)
+        ;
+    call = i < TINYMCP_LATER_MAX ? tinymcp_defer(&server) : 0;
+    if (!call) {
+        tinymcp_sink_puts(text, "too many counts at once");
+        return TINYMCP_TOOL_ERROR;
+    }
+    counts[i].call = call;
+    counts[i].to = to;
+    counts[i].at = 0;
+    counts[i].ms = ms;
+    counts[i].next = now_ms() + ms;
+    return TINYMCP_LATER;
+}
+
+/* Advance every count that is due; the ms until the next one, or -1. */
+static int count_tick(void)
+{
+    long long now = now_ms(), wait = -1;
+    unsigned i;
+
+    for (i = 0; i < TINYMCP_LATER_MAX; i++) {
+        tinymcp_sink_t text;
+        char n[24];
+
+        if (!counts[i].call)
+            continue;
+        while (counts[i].call && counts[i].next <= now) {
+            if (counts[i].at == counts[i].to) {
+                if (tinymcp_result_begin(&server, counts[i].call, &text) == 0) {
+                    snprintf(n, sizeof n, "counted to %ld", counts[i].to);
+                    tinymcp_sink_puts(&text, n);
+                    tinymcp_result_end(&server, counts[i].call, &text, 0);
+                }
+                counts[i].call = 0;
+                finished++;
+                break;
+            }
+            counts[i].at++;
+            snprintf(n, sizeof n, "%ld", counts[i].at);
+            tinymcp_progress(&server, counts[i].call, (unsigned long)counts[i].at,
+                             (unsigned long)counts[i].to, n);
+            counts[i].next += counts[i].ms;
+        }
+        if (counts[i].call && (wait < 0 || counts[i].next - now < wait))
+            wait = counts[i].next - now;
+    }
+    return (int)wait;
+}
+
+/* The client cancelled a count: it stops without a result. */
+static void cancel(void *ctx, unsigned call)
+{
+    unsigned i;
+
+    (void)ctx;
+    for (i = 0; i < TINYMCP_LATER_MAX; i++) {
+        if (counts[i].call == call) {
+            counts[i].call = 0;
+            cancelled++;
+        }
+    }
+}
 
 #define CONFIRM_SCHEMA "{\"type\":\"object\",\"properties\":{\"confirm\":" \
     "{\"type\":\"boolean\",\"title\":\"Delete it\"}},\"required\":[\"confirm\"]}"
@@ -332,6 +431,20 @@ static int call(void *ctx, const char *name, const tinymcp_args_t *args,
             return TINYMCP_EINVAL;
         return remove_file(fname, text);
     }
+    if (!strcmp(name, "count"))
+        return count_start(args, text);
+    if (!strcmp(name, "counters")) {
+        char line[64];
+        unsigned i, running = 0;
+
+        for (i = 0; i < TINYMCP_LATER_MAX; i++)
+            if (counts[i].call)
+                running++;
+        snprintf(line, sizeof line, "running %u finished %u cancelled %u",
+                 running, finished, cancelled);
+        tinymcp_sink_puts(text, line);
+        return TINYMCP_OK;
+    }
     if (!strcmp(name, "whoami")) {
         tinymcp_sink_puts(text, tinymcp_client(&server));
         return TINYMCP_OK;
@@ -426,7 +539,7 @@ static const tinymcp_host_t host = {
     tools, sizeof tools / sizeof tools[0],
     templates, sizeof templates / sizeof templates[0],
     list, read_file, call, watch, unwatch, send_line,
-    "tinymcp on POSIX", prompt_list, prompt_get, complete
+    "tinymcp on POSIX", prompt_list, prompt_get, complete, cancel
 };
 
 int main(int argc, char **argv)
@@ -446,9 +559,14 @@ int main(int argc, char **argv)
     tinymcp_init(&server, &host, NULL, in_buf, sizeof in_buf, out_buf,
                  sizeof out_buf, TINYMCP_SUBS_MAX);
     for (;;) {
+        struct pollfd in = { 0, POLLIN, 0 };
         char chunk[512];
-        ssize_t n = read(0, chunk, sizeof chunk);
+        ssize_t n;
 
+        /* Wait for input, or until the next count is due. */
+        if (poll(&in, 1, count_tick()) == 0)
+            continue;
+        n = read(0, chunk, sizeof chunk);
         if (n <= 0)
             break;
         if (trace)

@@ -16,10 +16,12 @@ what the binding maps, so another host can take the same shape.
 | `templates` | `tiku:///{+path}` and `tiku:///{+path}{?line,bytes}` |
 | `resource_list` | `/sys/vfs/manifest` paged by line, `/data` files from `tiku_vfs_list` |
 | `resource_read` | `tiku_vfs_read_policy`, so a node whose read acts is `TINYMCP_EEFFECT` |
-| `tool_call` | the VFS for `read`/`write`/`ls`; the shell parser with its output captured through `tinymcp_sink_putc` for `shell`; the BASIC mode API for `basic` |
+| `tool_call` | the VFS for `read`/`write`/`ls`; the shell parser with its output captured through `tinymcp_sink_putc` for `shell`; the BASIC job API for `basic`, a call kept with `tinymcp_defer` |
 | `watch`, `unwatch` | `tiku_vfs_watch` into the tinymcp process; `TIKU_EVENT_VFS` becomes `tinymcp_updated(slot)` |
 | `prompt_list`, `prompt_get` | `/data/prompt.<name>` files: the first line describes, `{{argument}}` places are the arguments, `tinymcp_render` fills them |
 | `complete` | a `path` argument against the namespace, through `tiku_vfs_list` |
+| `cancel` | stops the job of the cancelled `basic` call |
+| `send` | one console frame on channel `0xF3`, or `tcp_send` from the pump |
 
 ## The board asks
 
@@ -40,7 +42,22 @@ same call again within 60 s.
 `/sys/mcp/journal` is a RAM ring of the last 16 entries, `<seconds> <who>
 <what>`: questions, answers, the `write` and `shell` tools, and whatever a
 client writes there.
-| `send` | one console frame on channel `0xF3`, or `tcp_send` from the pump |
+
+## Jobs
+
+The `basic` tool runs a BASIC program, sent as numbered lines, as the
+board's one job: a headless run of the BASIC mode whose output goes to a
+1 KB ring.  The call is kept (`tinymcp_defer`) and answered when the job
+ends, with the output; each line printed goes out as
+`notifications/progress`, at most one every 250 ms, and the job is
+stopped after the call's `seconds` (60).  With `background: true` the call
+answers at once and `/sys/mcp/job/` carries the job: `seq`, `state`
+(`idle`, `running`, `done`, `error`, `stopped`), `by`, `out` (the ring,
+subscribable) and `stop` (any write ends it).  A cancelled call stops its
+job.  A job has no console and no system capability: `INPUT`, `REBOOT`
+and `POKE` are errors in it, and a write to a node that needs
+`TIKU_VFS_CAP_SYS` (the clock target, power, the layout, the watchdog) is
+`EPERM`.
 
 ## Streams
 

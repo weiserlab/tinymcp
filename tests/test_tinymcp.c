@@ -1,5 +1,5 @@
 /*
- * tinymcp v0.4
+ * tinymcp v0.5
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
@@ -7,7 +7,8 @@
  *
  * test_tinymcp.c - the protocol against a fake host: both eras, every
  * method, every error code, the buffers' edges, subscriptions and their
- * eviction, prompts and completion.  Each check is known to fail on a mutant (tests/mutants.sh).
+ * eviction, prompts and completion, calls answered later.  Each check is
+ * known to fail on a mutant (tests/mutants.sh).
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -30,6 +31,10 @@ static char watched[TINYMCP_SUBS_MAX][64];
 static int unwatched[TINYMCP_SUBS_MAX];
 static unsigned last_line, last_bytes;
 static tinymcp_t *touch_target;   /* the instance the touch tool notifies */
+static unsigned kept;             /* the handle the slow tool was given */
+static unsigned cancelled[4];     /* the calls host->cancel was told of */
+static unsigned ncancelled;
+static int inside_progress, inside_begin;  /* what they returned in a call */
 
 static int fake_send(void *ctx, const char *msg, size_t len)
 {
@@ -86,6 +91,10 @@ static int fake_read(void *ctx, const char *uri, unsigned line, unsigned bytes,
     }
     if (!strcmp(uri, "test:///effect"))
         return TINYMCP_EEFFECT;
+    if (!strcmp(uri, "test:///defer")) {
+        tinymcp_sink_puts(text, tinymcp_defer(touch_target) ? "kept" : "not kept");
+        return 0;
+    }
     if (!strcmp(uri, "test:///guarded"))
         return guarded(text);
     if (!strcmp(uri, "test:///long")) {
@@ -197,6 +206,31 @@ static int fake_tool(void *ctx, const char *name, const tinymcp_args_t *args,
     if (!strcmp(name, "reprompt")) {
         tinymcp_prompts_changed(touch_target);
         tinymcp_sink_puts(text, "reprompted");
+        return TINYMCP_OK;
+    }
+    if (!strcmp(name, "slow") || !strcmp(name, "slow2")) {
+        kept = tinymcp_defer(touch_target);
+        if (!strcmp(name, "slow2") && tinymcp_defer(touch_target) != kept)
+            kept = 99;
+        if (!kept) {
+            tinymcp_sink_puts(text, "no room");
+            return TINYMCP_TOOL_ERROR;
+        }
+        return TINYMCP_LATER;
+    }
+    if (!strcmp(name, "keepnot")) {
+        kept = tinymcp_defer(touch_target);
+        tinymcp_sink_puts(text, "now");
+        return TINYMCP_OK;
+    }
+    if (!strcmp(name, "nokeep"))
+        return TINYMCP_LATER;
+    if (!strcmp(name, "inside")) {
+        tinymcp_sink_t other;
+
+        inside_progress = tinymcp_progress(touch_target, kept, 1, 0, NULL);
+        inside_begin = tinymcp_result_begin(touch_target, kept, &other);
+        tinymcp_sink_puts(text, "inside");
         return TINYMCP_OK;
     }
     if (!strcmp(name, "flag")) {
@@ -324,21 +358,44 @@ static const tinymcp_host_t host = {
     "fake", "9.9", "Be nice to the fake.",
     tools, NTOOLS, templates, 2,
     fake_list, fake_read, fake_tool, fake_watch, fake_unwatch, fake_send,
-    NULL, NULL, NULL, NULL
+    NULL, NULL, NULL, NULL, NULL
 };
 
 static const tinymcp_host_t host_full = {
     "fake", "9.9", "Be nice to the fake.",
     tools, NTOOLS, templates, 2,
     fake_list, fake_read, fake_tool, fake_watch, fake_unwatch, fake_send,
-    "The Fake", fake_prompt_list, fake_prompt_get, fake_complete
+    "The Fake", fake_prompt_list, fake_prompt_get, fake_complete, NULL
+};
+
+static void fake_cancel(void *ctx, unsigned call)
+{
+    (void)ctx;
+    if (ncancelled < 4)
+        cancelled[ncancelled] = call;
+    ncancelled++;
+}
+
+static const tinymcp_tool_t later_tools[] = {
+    { "slow", NULL, "{\"type\":\"object\"}" },
+    { "slow2", NULL, "{\"type\":\"object\"}" },
+    { "keepnot", NULL, "{\"type\":\"object\"}" },
+    { "nokeep", NULL, "{\"type\":\"object\"}" },
+    { "inside", NULL, "{\"type\":\"object\"}" },
+};
+
+static const tinymcp_host_t host_later = {
+    "fake", "9.9", NULL,
+    later_tools, sizeof later_tools / sizeof later_tools[0], templates, 2,
+    fake_list, fake_read, fake_tool, fake_watch, fake_unwatch, fake_send,
+    "The Fake", NULL, NULL, NULL, fake_cancel
 };
 
 static const tinymcp_host_t host_plain = {
     "plain", "1", NULL,
     tools, 1, NULL, 0,
     NULL, NULL, fake_tool, NULL, NULL, fake_send,
-    NULL, NULL, NULL, NULL
+    NULL, NULL, NULL, NULL, NULL
 };
 
 /* The checks */
@@ -1410,6 +1467,151 @@ static void consent_accessors(void)
     t.in_state.type = TINYMCP_J_NONE;
 }
 
+#define CALL(id, tool, meta) \
+    "{\"jsonrpc\":\"2.0\",\"id\":" id ",\"method\":\"tools/call\"," \
+    "\"params\":{\"name\":\"" tool "\"" meta "}}"
+#define TOKEN(tok) ",\"_meta\":{\"progressToken\":" tok "," \
+    "\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"," \
+    "\"io.modelcontextprotocol/clientCapabilities\":{}}"
+#define CANCEL(id) "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\"," \
+    "\"params\":{\"requestId\":" id "}}"
+#define SERVER "\"_meta\":{\"io.modelcontextprotocol/serverInfo\":" \
+    "{\"name\":\"fake\",\"title\":\"The Fake\",\"version\":\"9.9\"}}"
+
+/* A call kept open: progress, the result later, cancel, the table's edges. */
+static void later_calls(void)
+{
+    tinymcp_sink_t text;
+    unsigned first;
+    int i;
+
+    reset(&host_later, sizeof out_buf, 4);
+    ncancelled = 0;
+    CHECK(tinymcp_defer(&t) == 0);
+    /* Only a tool call can be kept. */
+    say("{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"resources/read\","
+        "\"params\":{\"uri\":\"test:///defer\"," META "}}");
+    CONTAINS(last(), "\"text\":\"not kept\"");
+    CHECK(say(CALL("1", "slow", TOKEN("\"p1\""))) == 0);
+    CHECK(kept == 1);
+    CHECK(tinymcp_progress(&t, kept, 1, 3, "one") == 0);
+    SAME(last(), "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\","
+                 "\"params\":{\"progressToken\":\"p1\",\"progress\":1,\"total\":3,"
+                 "\"message\":\"one\"}}");
+    CHECK(tinymcp_progress(&t, kept, 2, 0, NULL) == 0);
+    SAME(last(), "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\","
+                 "\"params\":{\"progressToken\":\"p1\",\"progress\":2}}");
+    CHECK(tinymcp_progress(&t, 0, 1, 0, NULL) == -1);
+    CHECK(tinymcp_progress(&t, 2, 1, 0, NULL) == -1);
+    CHECK(tinymcp_progress(&t, TINYMCP_LATER_MAX + 1, 1, 0, NULL) == -1);
+    /* Other requests are served while it is kept; inside one, neither
+     * progress nor a result may be written. */
+    say("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}");
+    CONTAINS(last(), "\"id\":2,\"result\":{");
+    say(CALL("3", "inside", TOKEN("1")));
+    CHECK(inside_progress == -1 && inside_begin == -1);
+    CONTAINS(last(), "\"id\":3,");
+    CONTAINS(last(), "\"text\":\"inside\"}]");
+    /* The result, in the revision the call came in. */
+    CHECK(tinymcp_result_begin(&t, kept, &text) == 0);
+    CHECK(tinymcp_result_begin(&t, kept, &text) == -1);
+    tinymcp_sink_puts(&text, "done \"q\"");
+    tinymcp_result_end(&t, kept, &text, 0);
+    SAME(last(), "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":"
+                 "\"complete\"," SERVER ",\"content\":[{\"type\":\"text\","
+                 "\"text\":\"done \\\"q\\\"\"}]}}");
+    CHECK(tinymcp_progress(&t, kept, 3, 0, NULL) == -1);
+    CHECK(tinymcp_result_begin(&t, kept, &text) == -1);
+    CHECK(!t.busy && !t.later_open);
+    /* An error result, a number token, the end of an unopened result. */
+    say(CALL("4", "slow", TOKEN("7")));
+    CHECK(tinymcp_progress(&t, kept, 5, 0, NULL) == 0);
+    CONTAINS(last(), "\"progressToken\":7,\"progress\":5}");
+    first = (unsigned)nsent;
+    tinymcp_result_end(&t, kept, &text, 1);
+    CHECK((unsigned)nsent == first);
+    tinymcp_result_begin(&t, kept, &text);
+    tinymcp_sink_puts(&text, "bad");
+    tinymcp_result_end(&t, kept, &text, 1);
+    CONTAINS(last(), "\"id\":4,");
+    CONTAINS(last(), "\"text\":\"bad\"}],\"isError\":true}}");
+    /* Text past the buffer is cut and marked. */
+    say(CALL("5", "slow", META));
+    CHECK(tinymcp_progress(&t, kept, 1, 0, NULL) == -1);
+    tinymcp_result_begin(&t, kept, &text);
+    for (i = 0; i < 20000; i++)
+        tinymcp_sink_putc(&text, 'z');
+    tinymcp_result_end(&t, kept, &text, 0);
+    CONTAINS(last(), "zz\\n[cut]\"}],\"isError\":true}}");
+    /* Cancelled: the host is told, nothing is sent, the call is gone. */
+    say(CALL("6", "slow", TOKEN("\"c\"")));
+    first = kept;
+    say(CALL("\"six\"", "slow", TOKEN("\"d\"")));
+    CHECK(kept == 2 && first == 1);
+    say(CALL("8", "slow", META));
+    CONTAINS(last(), "\"id\":8,");
+    CONTAINS(last(), "\"text\":\"no room\"}],\"isError\":true");
+    CHECK(say(CANCEL("7")) == 0 && ncancelled == 0);
+    CHECK(say(CANCEL("\"six\"")) == 0 && ncancelled == 1 && cancelled[0] == 2);
+    CHECK(tinymcp_result_begin(&t, 2, &text) == -1);
+    CHECK(say(CANCEL("6")) == 0 && ncancelled == 2 && cancelled[1] == 1);
+    CHECK(tinymcp_progress(&t, 1, 1, 0, NULL) == -1);
+    /* A tool that returns LATER without keeping the call is an error; one
+     * that keeps it and answers now leaves nothing open; asking twice in one
+     * call gives one handle. */
+    say(CALL("9", "nokeep", META));
+    CONTAINS(last(), "\"id\":9,\"error\":{\"code\":-32603,\"message\":"
+                     "\"the tool kept no call\"}");
+    say(CALL("10", "keepnot", TOKEN("1")));
+    CONTAINS(last(), "\"text\":\"now\"}]");
+    CHECK(kept == 1 && tinymcp_progress(&t, 1, 1, 0, NULL) == -1);
+    CHECK(say(CALL("11", "slow2", TOKEN("1"))) == 0 && kept == 1);
+    CHECK(t.deferred == 0 && t.cur_token.type == TINYMCP_J_NONE &&
+          t.cur_id.type == TINYMCP_J_NONE && !t.in_call);
+    /* A closed stream cancels what it kept. */
+    ncancelled = 0;
+    tinymcp_closed(&t);
+    CHECK(ncancelled == 1 && cancelled[0] == 1);
+    CHECK(tinymcp_progress(&t, 1, 1, 0, NULL) == -1);
+    /* An id too long to keep is refused; a token too long keeps the call
+     * without progress; an escaped id comes back as sent. */
+    say(CALL("\"0123456789012345678901234567890\"", "slow", META));
+    CONTAINS(last(), "\"text\":\"no room\"}],\"isError\":true");
+    say(CALL("12", "slow", TOKEN("\"0123456789012345678901234567890\"")));
+    CHECK(kept == 1 && tinymcp_progress(&t, kept, 1, 0, NULL) == -1);
+    say(CALL("\"a\\\"b\"", "slow", META));
+    tinymcp_result_begin(&t, kept, &text);
+    tinymcp_result_end(&t, kept, &text, 0);
+    CONTAINS(last(), "{\"jsonrpc\":\"2.0\",\"id\":\"a\\\"b\",\"result\"");
+    /* The handshake era's result has no resultType; a notification that came
+     * during the result follows it. */
+    reset(&host_later, sizeof out_buf, 4);
+    say("{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{"
+        "\"protocolVersion\":\"2025-11-25\",\"capabilities\":{}}}");
+    say("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/subscribe\","
+        "\"params\":{\"uri\":\"test:///a\"}}");
+    say(CALL("2", "slow", ",\"_meta\":{\"progressToken\":\"L\"}"));
+    CHECK(tinymcp_progress(&t, kept, 1, 2, NULL) == 0);
+    CONTAINS(last(), "\"progressToken\":\"L\",\"progress\":1,\"total\":2}");
+    tinymcp_result_begin(&t, kept, &text);
+    tinymcp_updated(&t, 0);
+    tinymcp_sink_puts(&text, "ok");
+    first = (unsigned)nsent;
+    tinymcp_result_end(&t, kept, &text, 0);
+    CHECK((unsigned)nsent == first + 2);
+    SAME(sent[nsent - 2], "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":"
+                          "[{\"type\":\"text\",\"text\":\"ok\"}]}}");
+    CONTAINS(last(), "notifications/resources/updated");
+    /* A reply that cannot fit even its envelope is an error. */
+    reset(&host_later, 160, 4);
+    say(CALL("1", "slow", META));
+    tinymcp_result_begin(&t, kept, &text);
+    tinymcp_result_end(&t, kept, &text, 0);
+    SAME(last(), "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32603,"
+                 "\"message\":\"reply does not fit the out buffer\"}}");
+    CHECK(t.errors == 1 && !t.busy);
+}
+
 int main(void)
 {
     json_edges();
@@ -1431,6 +1633,7 @@ int main(void)
     client_names();
     consent();
     consent_accessors();
+    later_calls();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

@@ -1,5 +1,5 @@
 /*
- * tinymcp v0.4
+ * tinymcp v0.5
  * The Model Context Protocol server as a library any firmware can carry.
  * http://tinymcp.org
  *
@@ -7,9 +7,9 @@
  *
  * tinymcp.c - one message in, one reply out.  A request carrying
  * _meta.protocolVersion is served statelessly; initialize switches the
- * stream to the handshake era; subscriptions live in the instance's slots.
- * Tools, resources, prompts and completion are the host's, through its
- * table.
+ * stream to the handshake era; subscriptions live in the instance's slots;
+ * a tool call the host keeps open is answered later.  Tools, resources,
+ * prompts and completion are the host's, through its table.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -89,19 +89,15 @@ static void library_meta(tinymcp_jw_t *w)
     tinymcp_jw_str(w, "tinymcp " TINYMCP_VERSION);
 }
 
-/* The result's opening; library adds the library's _meta member. */
-static void begin_result_with(req_t *r, int library)
+/* A result's first members, by revision; library adds the library's _meta
+ * member. */
+static void result_head(tinymcp_t *t, tinymcp_jw_t *w, int modern,
+                        int library)
 {
-    tinymcp_jw_t *w = &r->w;
-
-    tinymcp_jw_reset(w, 0);
-    tinymcp_jw_raw(w, "{\"jsonrpc\":\"2.0\",\"id\":");
-    write_id(w, &r->id);
-    tinymcp_jw_raw(w, ",\"result\":{");
-    if (r->modern) {
+    if (modern) {
         tinymcp_jw_raw(w, "\"resultType\":\"complete\",\"_meta\":{\"" META_SRV
                           "\":");
-        server_info(w, r->t->host);
+        server_info(w, t->host);
         if (library)
             library_meta(w);
         tinymcp_jw_raw(w, "}");
@@ -111,6 +107,18 @@ static void begin_result_with(req_t *r, int library)
         library_meta(w);
         tinymcp_jw_raw(w, "}");
     }
+}
+
+/* The result's opening. */
+static void begin_result_with(req_t *r, int library)
+{
+    tinymcp_jw_t *w = &r->w;
+
+    tinymcp_jw_reset(w, 0);
+    tinymcp_jw_raw(w, "{\"jsonrpc\":\"2.0\",\"id\":");
+    write_id(w, &r->id);
+    tinymcp_jw_raw(w, ",\"result\":{");
+    result_head(r->t, w, r->modern, library);
 }
 
 static void begin_result(req_t *r)
@@ -964,7 +972,17 @@ static void do_tools_call(req_t *r)
     tinymcp_jw_key(w, "content");
     tinymcp_jw_raw(w, "[{\"type\":\"text\",\"text\":\"");
     tinymcp_sink_init(&sink, w, r->t->out_cap - TAIL_RESERVE);
+    r->t->in_call = 1;
     rc = h->tool_call(r->t->ctx, name, &args, &sink);
+    r->t->in_call = 0;
+    if (rc == TINYMCP_LATER) {
+        if (!r->t->deferred)
+            error_reply(r, -32603, "the tool kept no call");
+        return;
+    }
+    /* Kept and answered now after all: the call is not open. */
+    if (r->t->deferred)
+        memset(&r->t->later[r->t->deferred - 1], 0, sizeof r->t->later[0]);
     if (rc == TINYMCP_NEED_INPUT) {
         input_required(r);
         return;
@@ -1289,14 +1307,31 @@ static void do_unsubscribe(req_t *r)
     end_result(r);
 }
 
+/* Drop the kept call; tell the host when the client cancelled it. */
+static void later_drop(tinymcp_t *t, unsigned i, int cancelled)
+{
+    memset(&t->later[i], 0, sizeof t->later[i]);
+    if (cancelled && t->host->cancel)
+        t->host->cancel(t->ctx, i + 1);
+}
+
 static void do_notification(req_t *r)
 {
+    tinymcp_t *t = r->t;
     tinymcp_jv_t v;
     char id[TINYMCP_ID_MAX];
+    unsigned i;
 
-    if (!strcmp(r->method, "notifications/cancelled") &&
-        param(r, "requestId", &v) && id_text(&v, id, sizeof id) == 0)
-        listen_end(r->t, id, 0);
+    if (strcmp(r->method, "notifications/cancelled") ||
+        !param(r, "requestId", &v) || id_text(&v, id, sizeof id) != 0)
+        return;
+    for (i = 0; i < TINYMCP_LATER_MAX; i++) {
+        if (t->later[i].used && !strcmp(t->later[i].id, id)) {
+            later_drop(t, i, 1);
+            return;
+        }
+    }
+    listen_end(t, id, 0);
 }
 
 static int version_supported(const tinymcp_jv_t *v)
@@ -1386,6 +1421,10 @@ static void process(tinymcp_t *t, char *msg, size_t len)
     t->in_responses.type = TINYMCP_J_NONE;
     t->in_state.type = TINYMCP_J_NONE;
     t->el_key = t->el_message = t->el_schema = t->el_state = NULL;
+    t->cur_id.type = TINYMCP_J_NONE;
+    t->cur_token.type = TINYMCP_J_NONE;
+    t->cur_modern = 0;
+    t->deferred = 0;
     k = tinymcp_json_value(msg, len, &root);
     if (!k || root.type != TINYMCP_J_OBJECT) {
         error_reply(&r, -32700, "parse error");
@@ -1463,8 +1502,18 @@ static void process(tinymcp_t *t, char *msg, size_t len)
         else
             t->client[0] = 0;
     }
+    /* Kept in place, for a call the host may keep open. */
+    if (param(&r, "_meta", &meta) && meta.type == TINYMCP_J_OBJECT &&
+        tinymcp_json_get(&meta, "progressToken", &v) == 1 &&
+        (v.type == TINYMCP_J_STRING || v.type == TINYMCP_J_NUMBER))
+        t->cur_token = v;
+    t->cur_id = r.id;
+    t->cur_modern = (unsigned char)r.modern;
     dispatch(&r);
 out:
+    t->cur_id.type = TINYMCP_J_NONE;
+    t->cur_token.type = TINYMCP_J_NONE;
+    t->deferred = 0;
     t->busy = 0;
     t->elicits = 0;
     t->in_responses.type = TINYMCP_J_NONE;
@@ -1612,6 +1661,10 @@ void tinymcp_closed(tinymcp_t *t)
     for (i = 0; i < t->max_subs; i++)
         if (t->subs[i].used)
             slot_clear(t, i);
+    /* Nobody is left to answer: the host stops the work. */
+    for (i = 0; i < TINYMCP_LATER_MAX; i++)
+        if (t->later[i].used)
+            later_drop(t, i, 1);
     t->era = TINYMCP_ERA_NONE;
     t->legacy_version = NULL;
     t->client[0] = 0;
@@ -1820,4 +1873,120 @@ int tinymcp_render(tinymcp_sink_t *sink, const char *text, size_t len,
         i += k + 3;
     }
     return 0;
+}
+
+/* Answering later */
+
+unsigned tinymcp_defer(tinymcp_t *t)
+{
+    tinymcp_later_t *l;
+    unsigned i;
+
+    if (!t->in_call)
+        return 0;
+    if (t->deferred)
+        return t->deferred;
+    for (i = 0; i < TINYMCP_LATER_MAX; i++) {
+        l = &t->later[i];
+        if (l->used)
+            continue;
+        if (id_text(&t->cur_id, l->id, sizeof l->id) != 0)
+            return 0;
+        /* A token too long to keep: the call runs without progress. */
+        if (t->cur_token.type == TINYMCP_J_NONE ||
+            id_text(&t->cur_token, l->token, sizeof l->token) != 0)
+            l->token[0] = 0;
+        l->modern = t->cur_modern;
+        l->used = 1;
+        t->deferred = (unsigned char)(i + 1);
+        return i + 1;
+    }
+    return 0;
+}
+
+static tinymcp_later_t *later_of(tinymcp_t *t, unsigned call)
+{
+    if (call == 0 || call > TINYMCP_LATER_MAX || !t->later[call - 1].used)
+        return NULL;
+    return &t->later[call - 1];
+}
+
+int tinymcp_progress(tinymcp_t *t, unsigned call, unsigned long done,
+                     unsigned long total, const char *message)
+{
+    tinymcp_later_t *l = later_of(t, call);
+    tinymcp_jw_t w;
+
+    if (!l || !l->token[0] || t->busy)
+        return -1;
+    tinymcp_jw_init(&w, t->out, t->out_cap);
+    tinymcp_jw_raw(&w, "{\"jsonrpc\":\"2.0\",\"method\":"
+                       "\"notifications/progress\",\"params\":{"
+                       "\"progressToken\":");
+    tinymcp_jw_raw(&w, l->token);
+    tinymcp_jw_key(&w, "progress");
+    tinymcp_jw_ulong(&w, done);
+    if (total) {
+        tinymcp_jw_key(&w, "total");
+        tinymcp_jw_ulong(&w, total);
+    }
+    if (message) {
+        tinymcp_jw_key(&w, "message");
+        tinymcp_jw_str(&w, message);
+    }
+    tinymcp_jw_raw(&w, "}}");
+    emit(t, &w);
+    return 0;
+}
+
+int tinymcp_result_begin(tinymcp_t *t, unsigned call, tinymcp_sink_t *text)
+{
+    tinymcp_later_t *l = later_of(t, call);
+    tinymcp_jw_t *w = &t->later_w;
+
+    if (!l || t->busy)
+        return -1;
+    /* Notifications wait until the result is out. */
+    t->busy = 1;
+    t->later_open = (unsigned char)call;
+    tinymcp_jw_init(w, t->out, t->out_cap);
+    tinymcp_jw_raw(w, "{\"jsonrpc\":\"2.0\",\"id\":");
+    tinymcp_jw_raw(w, l->id);
+    tinymcp_jw_raw(w, ",\"result\":{");
+    result_head(t, w, l->modern, 0);
+    tinymcp_jw_key(w, "content");
+    tinymcp_jw_raw(w, "[{\"type\":\"text\",\"text\":\"");
+    tinymcp_sink_init(text, w, t->out_cap - TAIL_RESERVE);
+    return 0;
+}
+
+void tinymcp_result_end(tinymcp_t *t, unsigned call,
+                        const tinymcp_sink_t *text, int is_error)
+{
+    tinymcp_later_t *l = later_of(t, call);
+    tinymcp_jw_t *w = &t->later_w;
+
+    if (!l || t->later_open != call)
+        return;
+    if (text->cut)
+        tinymcp_jw_raw(w, "\\n[cut]");
+    tinymcp_jw_raw(w, "\"}]");
+    if (is_error || text->cut) {
+        tinymcp_jw_key(w, "isError");
+        tinymcp_jw_raw(w, "true");
+    }
+    tinymcp_jw_raw(w, "}}");
+    if (w->full) {
+        tinymcp_jw_reset(w, 0);
+        tinymcp_jw_raw(w, "{\"jsonrpc\":\"2.0\",\"id\":");
+        tinymcp_jw_raw(w, l->id);
+        tinymcp_jw_raw(w, ",\"error\":{\"code\":-32603,\"message\":"
+                          "\"reply does not fit the out buffer\"}}");
+        t->errors++;
+    }
+    emit(t, w);
+    later_drop(t, call - 1, 0);
+    t->later_open = 0;
+    t->busy = 0;
+    flush_pending(t);
 }
