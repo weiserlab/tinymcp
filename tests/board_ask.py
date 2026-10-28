@@ -217,6 +217,10 @@ def main(port):
         expect("rule-ask", False, f"the test's rule stayed: {left!r}")
 
     # The board asks with nobody attached; attend.py answers from the API.
+    # The rule's question is answered first: attend.py answers whatever
+    # question waits when it starts, and only its own may be waiting.
+    b.tool("write", {"path": "/sys/mcp/ask/answer",
+                     "value": f"#{b.read('/sys/mcp/ask/seq')} done"})
     b.tool("shell", {"line": "once 4 ask What should led2 show?"})
     b.link.close()
     srv = http.server.HTTPServer(("127.0.0.1", 0), StubAPI)
