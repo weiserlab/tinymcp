@@ -68,8 +68,9 @@ channel's callback copies the frame and marks it pending; the request runs
 from the shell's pump between command lines, never inside the callback.
 `mcp http <port>` serves Streamable HTTP at `/mcp` through
 `tinymcp_http.c`, two connections at once, each with its own `tinymcp_t`.
-Each TCP connection's state and buffers are an arena leased from the SRAM
-tier when it connects and zeroed and given back when it closes; a reply
+Each TCP connection's state and buffers are an arena leased when it
+connects, from SRAM while it fits there and from PSRAM once SRAM is short,
+and zeroed and given back when it closes; a reply
 goes out in MSS-sized segments, the console pumped while the TX pool is
 full.  The host bridge (`bridge/tinymcp.py`) turns a client's stdio into
 console frames, or with `--tcp` into lines on the connection.
@@ -79,7 +80,7 @@ console frames, or with `--tcp` into lines on the connection.
 | Port class | in | out |
 |---|---|---|
 | Cortex-M (nRF54L, RP2350, Ambiq, RA8P1, STM32N6), ESP32-C5 | 1024 | 4608 |
-| ESP32-C61, ESP32-P4 | 2048 | 8192, in PSRAM |
+| ESP32-C61, ESP32-P4 | 2048 | 8192 |
 | MSP430FR5994 | 256 | 512 |
 
 ## Authority

@@ -7,8 +7,9 @@
 # Authors: Ambuj Varshney <ambuj@tiku-os.org>
 #
 # board_http.py - the official mcp SDK's Streamable HTTP client against a
-# tikuOS board's `mcp http` port, with no bridge: the slip_tcp relay carries
-# TCP over the board's console line, and the key travels as a bearer token.
+# tikuOS board's `mcp http` port, with no bridge: dialled at the board's
+# address on the LAN, or through the slip_tcp relay carrying TCP over its
+# console line.  The key travels as a bearer token.
 #
 # SPDX-License-Identifier: Apache-2.0
 
@@ -66,15 +67,15 @@ async def declined(context, params):
 class Session:
     """An SDK client over HTTP to the relay, with a bearer token or none."""
 
-    def __init__(self, port, key=None):
-        self.port = port
+    def __init__(self, at, key=None):
+        self.at = at
         self.key = key
 
     async def __aenter__(self):
         headers = {"Authorization": f"Bearer {self.key}"} if self.key else {}
         self.http = create_mcp_http_client(headers=headers)
         await self.http.__aenter__()
-        transport = streamable_http_client(f"http://127.0.0.1:{self.port}/mcp",
+        transport = streamable_http_client(f"http://{self.at[0]}:{self.at[1]}/mcp",
                                            http_client=self.http)
         self.client = Client(transport, mode="2026-07-28", read_timeout_seconds=60,
                              cache=None, elicitation_callback=declined,
@@ -90,8 +91,8 @@ async def read(c, path):
     return text_of(await c.call_tool("read", {"path": path})).strip()
 
 
-def raw(port, headers, method="POST", body=b"{}"):
-    c = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
+def raw(at, headers, method="POST", body=b"{}"):
+    c = http.client.HTTPConnection(at[0], at[1], timeout=20)
     c.request(method, "/mcp", body=body, headers=headers)
     st = c.getresponse().status
     c.close()
@@ -102,10 +103,10 @@ COUNT = ('10 FOR I = 1 TO 3\n20 PRINT "LINE" + STR$(I)\n30 DELAY 400\n'
          '40 NEXT I\n')
 
 
-async def basic_once(port):
+async def basic_once(at):
     """BASIC makes its arena on first use and keeps it: run once before the
     arenas are counted, so the counts hold only what connections leave."""
-    async with Session(port, key=KEY) as c:
+    async with Session(at, key=KEY) as c:
         await c.call_tool("basic", {"program": "10 PRINT 1\n"})
 
 
@@ -117,8 +118,8 @@ def open_conns(tcp):
     return 0
 
 
-async def checks_open(port, wire):
-    async with Session(port) as c:
+async def checks_open(at, wire):
+    async with Session(at) as c:
         tcp = await read(c, "/sys/mcp/tcp")
         up = (await c.read_resource("tiku:///sys/uptime")).contents[0].text.strip()
         expect("http-read", f"http {PORT} /mcp, 1 of 2 connected" in tcp and up.isdigit(),
@@ -145,8 +146,8 @@ async def checks_open(port, wire):
     return arenas(reserved) - mine
 
 
-async def checks_keyed(port):
-    async with Session(port, key=KEY) as c:
+async def checks_keyed(at):
+    async with Session(at, key=KEY) as c:
         w = await c.call_tool("write", {"path": "/dev/led0", "value": "1"})
         led = await read(c, "/dev/led0")
         await c.call_tool("write", {"path": "/dev/led0", "value": "0"})
@@ -189,7 +190,7 @@ async def checks_keyed(port):
         after = int(await read(c, "/sys/uptime"))
         expect("http-consent", r.is_error and after >= before,
                f"{text_of(r)[:40]!r}; uptime {before} -> {after}")
-    async with Session(port, key=KEY + "x") as c:
+    async with Session(at, key=KEY + "x") as c:
         w = await c.call_tool("write", {"path": "/dev/led0", "value": "1"})
         expect("http-wrong-key", w.is_error and "only reads" in text_of(w), f"{text_of(w)[:40]!r}")
 
@@ -203,7 +204,7 @@ def slip_on(wire, console, drain):
         drain(0.8)
 
 
-async def main(port_name):
+async def main(port_name, address=None):
     ser = serial.Serial(port_name, 115200, timeout=0)
     wire = slip_tcp.Wire(ser)
     console = bytearray()
@@ -216,7 +217,8 @@ async def main(port_name):
 
     wire.type("")
     drain(0.5)
-    slip_on(wire, console, drain)
+    if not address:
+        slip_on(wire, console, drain)
     wire.type(f"write /sys/mcp/key {KEY}")
     drain(0.5)
     wire.type(f"mcp http {PORT}")
@@ -227,20 +229,30 @@ async def main(port_name):
 
     stop = threading.Event()
     ready = []
-    t = threading.Thread(target=slip_tcp.relay, args=(wire, PORT, stop, ready), daemon=True)
+    def soak():
+        """On the LAN the console carries only typed lines and their output."""
+        while not stop.is_set():
+            drain(0.5)
+
+    if address:
+        ready.append((address, PORT))
+        t = threading.Thread(target=soak, daemon=True)
+    else:
+        t = threading.Thread(target=slip_tcp.relay, args=(wire, PORT, stop, ready),
+                             daemon=True)
     t.start()
     while not ready:
         time.sleep(0.05)
+    at = ready[0] if address else ("127.0.0.1", ready[0])
     try:
-        await basic_once(ready[0])
-        during = await checks_open(ready[0], wire)
-        await checks_keyed(ready[0])
+        await basic_once(at)
+        during = await checks_open(at, wire)
+        await checks_keyed(at)
         hs = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
-        got = (raw(ready[0], dict(hs, Origin="http://evil.example")),
-               raw(ready[0], hs, method="GET"))
+        got = (raw(at, dict(hs, Origin="http://evil.example")), raw(at, hs, method="GET"))
         expect("http-wire", got == (403, 405), f"a web origin and a GET: {got}")
         # Arenas beside the connections' own: the same in a later session.
-        async with Session(ready[0]) as c:
+        async with Session(at) as c:
             await anyio.sleep(1.0)
             reserved = await read(c, "/sys/mem/reservations")
             mine = open_conns(await read(c, "/sys/mcp/tcp"))
@@ -259,7 +271,7 @@ async def main(port_name):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("usage: board_http.py <serial port>")
+    if len(sys.argv) not in (2, 3):
+        print("usage: board_http.py <serial port> [<board address on the LAN>]")
         sys.exit(2)
-    sys.exit(anyio.run(main, sys.argv[1]))
+    sys.exit(anyio.run(main, *sys.argv[1:]))
