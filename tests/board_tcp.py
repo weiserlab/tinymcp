@@ -55,9 +55,8 @@ def text_of(r):
 
 
 def arenas(text):
-    """The live SRAM arenas /sys/mem/reservations lists."""
-    return len([x for x in text.splitlines() if " sram:" in x and " arena " in x
-                and "state=live" in x])
+    """The live arenas /sys/mem/reservations lists, in any tier."""
+    return len([x for x in text.splitlines() if " arena " in x and "state=live" in x])
 
 
 async def declined(context, params):
@@ -199,7 +198,7 @@ async def main(port_name):
             tcp = await read(c, "/sys/mcp/tcp")
             again = arenas(await read(c, "/sys/mem/reservations"))
         expect("tcp-lease", during == again and ", connected " in tcp,
-               f"live SRAM arenas during the first connection {during}, during a later one {again}")
+               f"live arenas during the first connection {during}, during a later one {again}")
     finally:
         stop.set()
         t.join(2)

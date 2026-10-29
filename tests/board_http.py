@@ -55,9 +55,8 @@ def text_of(r):
 
 
 def arenas(text):
-    """The live SRAM arenas /sys/mem/reservations lists."""
-    return len([x for x in text.splitlines() if " sram:" in x and " arena " in x
-                and "state=live" in x])
+    """The live arenas /sys/mem/reservations lists, in any tier."""
+    return len([x for x in text.splitlines() if " arena " in x and "state=live" in x])
 
 
 async def declined(context, params):
@@ -101,6 +100,13 @@ def raw(port, headers, method="POST", body=b"{}"):
 
 COUNT = ('10 FOR I = 1 TO 3\n20 PRINT "LINE" + STR$(I)\n30 DELAY 400\n'
          '40 NEXT I\n')
+
+
+async def basic_once(port):
+    """BASIC makes its arena on first use and keeps it: run once before the
+    arenas are counted, so the counts hold only what connections leave."""
+    async with Session(port, key=KEY) as c:
+        await c.call_tool("basic", {"program": "10 PRINT 1\n"})
 
 
 def open_conns(tcp):
@@ -226,6 +232,7 @@ async def main(port_name):
     while not ready:
         time.sleep(0.05)
     try:
+        await basic_once(ready[0])
         during = await checks_open(ready[0], wire)
         await checks_keyed(ready[0])
         hs = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
@@ -239,7 +246,7 @@ async def main(port_name):
             mine = open_conns(await read(c, "/sys/mcp/tcp"))
         again = arenas(reserved) - mine
         expect("http-lease", during == again,
-               f"other live SRAM arenas: {during} in the first session, {again} later")
+               f"other live arenas: {during} in the first session, {again} later")
     finally:
         stop.set()
         t.join(5)
